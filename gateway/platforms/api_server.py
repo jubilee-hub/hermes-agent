@@ -1165,6 +1165,88 @@ class APIServerAdapter(BasePlatformAdapter):
             ],
         })
 
+    async def _handle_session_root_canary(self, request: "web.Request") -> "web.Response":
+        # Agent SaaS self-canary (#369 4c-b): drive the real file tools through 6
+        # escape attempts against a throwaway probe root and report which were
+        # denied. Lets the SaaS worker verify session-root enforcement over HTTP
+        # without a docker socket. Operates ONLY on the probe dir, never a real
+        # session root.
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        import json as _json
+        import shutil as _shutil
+        from pathlib import Path as _Path
+
+        try:
+            from agent.runtime_cwd import clear_session_file_root, set_session_file_root
+            from tools.file_tools import read_file_tool, search_tool, write_file_tool
+        except Exception as exc:  # pragma: no cover
+            return web.json_response(
+                {"error": "canary_unavailable", "detail": type(exc).__name__}, status=500
+            )
+
+        root = _Path("/workspace/.agent-saas-canary-probe").resolve()
+        outside = root.parent / (root.name + "-outside")
+        _shutil.rmtree(root, ignore_errors=True)
+        _shutil.rmtree(outside, ignore_errors=True)
+        root.mkdir(parents=True, exist_ok=True)
+        outside.mkdir(parents=True, exist_ok=True)
+
+        def _parse(value):
+            try:
+                return _json.loads(value)
+            except Exception:
+                return {"raw": value}
+
+        checks = {}
+        set_session_file_root(str(root))
+        try:
+            written = _parse(write_file_tool("inside.md", "canary\n", task_id="agent-saas-canary"))
+            checks["allowedWriteInsideRoot"] = not written.get("error")
+            read_back = _parse(read_file_tool("inside.md", task_id="agent-saas-canary"))
+            checks["allowedReadInsideRoot"] = (not read_back.get("error")) and (
+                "canary" in _json.dumps(read_back)
+            )
+            checks["relativeEscapeDenied"] = bool(
+                _parse(write_file_tool("../escape.md", "x\n", task_id="agent-saas-canary")).get("error")
+            )
+            checks["absoluteEscapeDenied"] = bool(
+                _parse(
+                    write_file_tool(str(outside / "escape.md"), "x\n", task_id="agent-saas-canary")
+                ).get("error")
+            )
+            try:
+                (root / "link").symlink_to(outside, target_is_directory=True)
+            except Exception:
+                pass
+            checks["symlinkEscapeDenied"] = bool(
+                _parse(
+                    write_file_tool("link/escape.md", "x\n", task_id="agent-saas-canary")
+                ).get("error")
+            )
+            checks["searchTreeEscapeDenied"] = bool(
+                _parse(search_tool("canary", path=".", task_id="agent-saas-canary")).get("error")
+            )
+        finally:
+            clear_session_file_root()
+            _shutil.rmtree(root, ignore_errors=True)
+            _shutil.rmtree(outside, ignore_errors=True)
+
+        required = (
+            "allowedWriteInsideRoot",
+            "allowedReadInsideRoot",
+            "relativeEscapeDenied",
+            "absoluteEscapeDenied",
+            "symlinkEscapeDenied",
+            "searchTreeEscapeDenied",
+        )
+        enforced = all(checks.get(name) for name in required)
+        return web.json_response(
+            {"object": "hermes.session_root_canary", "enforced": enforced, "checks": checks}
+        )
+
     async def _handle_capabilities(self, request: "web.Request") -> "web.Response":
         """GET /v1/capabilities — advertise the stable API surface.
 
@@ -4241,6 +4323,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/health", self._handle_health)
             self._app.router.add_get("/v1/models", self._handle_models)
             self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
+            self._app.router.add_post("/v1/session-root-canary", self._handle_session_root_canary)
             self._app.router.add_get("/v1/skills", self._handle_skills)
             self._app.router.add_get("/v1/toolsets", self._handle_toolsets)
             # Session/client control surface (thin wrappers over SessionDB + _run_agent)
