@@ -2,8 +2,8 @@
 OpenAI-compatible API server platform adapter.
 
 Exposes an HTTP server with endpoints:
-- POST /v1/chat/completions        — OpenAI Chat Completions format (stateless; opt-in session continuity via X-Hermes-Session-Id header; opt-in long-term memory scoping via X-Hermes-Session-Key header)
-- POST /v1/responses               — OpenAI Responses API format (stateful via previous_response_id; X-Hermes-Session-Key supported)
+- POST /v1/chat/completions        — OpenAI Chat Completions format (stateless; opt-in session continuity, memory scoping, and authenticated file-root enforcement headers)
+- POST /v1/responses               — OpenAI Responses API format (stateful via previous_response_id; the same authenticated session headers are supported)
 - GET  /v1/responses/{response_id} — Retrieve a stored response
 - DELETE /v1/responses/{response_id} — Delete a stored response
 - GET  /v1/models                  — lists hermes-agent and any configured model_routes aliases
@@ -843,9 +843,28 @@ class _IdempotencyCache:
 _idem_cache = _IdempotencyCache()
 
 
-def _make_request_fingerprint(body: Dict[str, Any], keys: List[str]) -> str:
+def _session_root_file_ops_supported() -> bool:
+    """Whether this runtime can enforce descriptor-anchored Session Roots."""
+    required_dir_fd = (os.open, os.mkdir, os.stat, os.unlink)
+    return (
+        os.name == "posix"
+        and bool(getattr(os, "O_NOFOLLOW", 0))
+        and all(operation in os.supports_dir_fd for operation in required_dir_fd)
+        and os.listdir in os.supports_fd
+    )
+
+
+def _make_request_fingerprint(
+    body: Dict[str, Any],
+    keys: List[str],
+    *,
+    execution_context: Optional[Dict[str, Any]] = None,
+) -> str:
     from hashlib import sha256
-    subset = {k: body.get(k) for k in keys}
+    subset = {
+        "body": {k: body.get(k) for k in keys},
+        "execution_context": execution_context or {},
+    }
     return sha256(repr(subset).encode("utf-8")).hexdigest()
 
 
@@ -1535,6 +1554,7 @@ class APIServerAdapter(BasePlatformAdapter):
     # (e.g. ``agent:main:webui:dm:user-42``) while staying small enough
     # that the sanitized form is safe to pass into Honcho / state.db.
     _MAX_SESSION_HEADER_LEN = 256
+    _MAX_SESSION_ROOT_HEADER_LEN = 1024
 
     def _parse_session_key_header(
         self, request: "web.Request"
@@ -1586,6 +1606,58 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=400,
             )
 
+        return raw, None
+
+    def _parse_session_root_header(
+        self, request: "web.Request"
+    ) -> tuple[Optional[str], Optional["web.Response"]]:
+        """Extract and validate the internal ``X-Hermes-Session-Root`` header.
+
+        The trusted control plane uses this request-scoped root to constrain
+        file tools.  The value is never echoed to clients.
+        """
+        raw = request.headers.get("X-Hermes-Session-Root", "")
+        if not raw:
+            return None, None
+
+        if not self._api_key:
+            return None, web.json_response(
+                _openai_error(
+                    "X-Hermes-Session-Root requires API key authentication. "
+                    "Configure API_SERVER_KEY to enable this feature."
+                ),
+                status=403,
+            )
+
+        if not _session_root_file_ops_supported():
+            return None, web.json_response(
+                _openai_error(
+                    "X-Hermes-Session-Root is not supported on this runtime"
+                ),
+                status=501,
+            )
+
+        if any(ord(char) < 0x20 or ord(char) == 0x7F for char in raw):
+            return None, web.json_response(
+                _openai_error("Invalid session root"),
+                status=400,
+            )
+        if len(raw) > self._MAX_SESSION_ROOT_HEADER_LEN:
+            return None, web.json_response(
+                _openai_error("Session root too long"),
+                status=400,
+            )
+        root_path = Path(raw).expanduser()
+        if not root_path.is_absolute():
+            return None, web.json_response(
+                _openai_error("Session root must be absolute"),
+                status=400,
+            )
+        if ".." in root_path.parts:
+            return None, web.json_response(
+                _openai_error("Session root must not contain '..' traversal"),
+                status=400,
+            )
         return raw, None
 
     # ------------------------------------------------------------------
@@ -2043,6 +2115,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 "realtime_voice": False,
                 "session_continuity_header": "X-Hermes-Session-Id",
                 "session_key_header": "X-Hermes-Session-Key",
+                "session_root_header": (
+                    "X-Hermes-Session-Root"
+                    if _session_root_file_ops_supported()
+                    else False
+                ),
                 "cors": bool(self._cors_origins),
             },
             "endpoints": {
@@ -2472,6 +2549,9 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
+        session_root, root_err = self._parse_session_root_header(request)
+        if root_err is not None:
+            return root_err
         session_id = request.match_info["session_id"]
         _, err = await self._get_existing_session_or_404(session_id)
         if err:
@@ -2492,6 +2572,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ephemeral_system_prompt=system_prompt,
             session_id=session_id,
             gateway_session_key=gateway_session_key,
+            session_root=session_root,
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
         final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
@@ -2514,6 +2595,9 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
+        session_root, root_err = self._parse_session_root_header(request)
+        if root_err is not None:
+            return root_err
         session_id = request.match_info["session_id"]
         _, err = await self._get_existing_session_or_404(session_id)
         if err:
@@ -2581,6 +2665,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     stream_delta_callback=_delta,
                     tool_progress_callback=_tool_progress,
                     gateway_session_key=gateway_session_key,
+                    session_root=session_root,
                 )
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
@@ -2713,6 +2798,9 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
+        session_root, root_err = self._parse_session_root_header(request)
+        if root_err is not None:
+            return root_err
 
         # Allow caller to continue an existing session by passing X-Hermes-Session-Id.
         # When provided, history is loaded from state.db instead of from the request body.
@@ -2864,6 +2952,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                session_root=session_root,
                 route=route,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
@@ -2884,12 +2973,22 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                session_root=session_root,
                 route=route,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
         if idempotency_key:
-            fp = _make_request_fingerprint(body, keys=["model", "messages", "tools", "tool_choice", "stream"])
+            fp = _make_request_fingerprint(
+                body,
+                keys=["model", "messages", "tools", "tool_choice", "stream"],
+                execution_context={
+                    "endpoint": "chat.completions",
+                    "session_id": session_id,
+                    "session_key": gateway_session_key,
+                    "session_root": session_root,
+                },
+            )
             try:
                 result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_completion)
             except Exception as e:
@@ -3792,6 +3891,9 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
+        session_root, root_err = self._parse_session_root_header(request)
+        if root_err is not None:
+            return root_err
 
         # Parse request body
         try:
@@ -3948,6 +4050,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                session_root=session_root,
                 route=route,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
@@ -3982,6 +4085,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                session_root=session_root,
                 route=route,
             )
 
@@ -3990,6 +4094,11 @@ class APIServerAdapter(BasePlatformAdapter):
             fp = _make_request_fingerprint(
                 body,
                 keys=["input", "instructions", "previous_response_id", "conversation", "model", "tools"],
+                execution_context={
+                    "endpoint": "responses",
+                    "session_key": gateway_session_key,
+                    "session_root": session_root,
+                },
             )
             try:
                 result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_response)
@@ -4593,6 +4702,7 @@ class APIServerAdapter(BasePlatformAdapter):
         chat_id: str = "",
         session_key: str = "",
         session_id: str = "",
+        session_root: str = "",
     ) -> list:
         """Bind session contextvars for an API-server agent run.
 
@@ -4616,6 +4726,8 @@ class APIServerAdapter(BasePlatformAdapter):
             chat_id=chat_id,
             session_key=session_key,
             session_id=session_id,
+            cwd=session_root,
+            file_root=session_root,
             async_delivery=False,
         )
 
@@ -4631,6 +4743,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_complete_callback=None,
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
+        session_root: Optional[str] = None,
         route: Optional[Dict[str, Any]] = None,
     ) -> tuple:
         """
@@ -4662,6 +4775,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     chat_id=session_id or "",
                     session_key=gateway_session_key or session_id or "",
                     session_id=session_id or "",
+                    session_root=session_root or "",
                 )
                 try:
                     agent = self._create_agent(
@@ -4779,6 +4893,9 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
+        session_root, root_err = self._parse_session_root_header(request)
+        if root_err is not None:
+            return root_err
 
         # Enforce concurrency limit (shared across all agent-serving
         # endpoints; configurable via gateway.api_server.max_concurrent_runs).
@@ -4973,7 +5090,10 @@ class APIServerAdapter(BasePlatformAdapter):
                             # environment state.
                             approval_token = set_current_session_key(approval_session_key)
                             session_tokens = self._bind_api_server_session(
+                                chat_id=session_id,
                                 session_key=approval_session_key,
+                                session_id=session_id,
+                                session_root=session_root or "",
                             )
                             register_gateway_notify(approval_session_key, _approval_notify)
                             r = agent.run_conversation(

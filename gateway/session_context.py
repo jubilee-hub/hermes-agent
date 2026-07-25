@@ -167,6 +167,7 @@ def set_session_vars(
     message_id: str = "",
     profile: str = "",
     cwd: str = "",
+    file_root: str = "",
     async_delivery: bool = True,
     ui_session_id: str = "",
 ) -> list:
@@ -179,6 +180,7 @@ def set_session_vars(
     only for API compatibility.
 
     ``cwd`` pins the logical working directory for this context.
+    ``file_root`` pins the root enforced by file tools.
 
     ``async_delivery`` declares whether this session's channel can route a
     background completion back to the agent after the turn ends (see
@@ -190,6 +192,24 @@ def set_session_vars(
     # "ContextVar-authoritative, strip on _UNSET" — see session_context_engaged.
     global _session_context_engaged
     _session_context_engaged = True
+    from agent.runtime_cwd import (
+        clear_session_cwd,
+        clear_session_file_root,
+        set_session_cwd,
+        set_session_file_root,
+    )
+
+    set_session_cwd(cwd)
+    try:
+        set_session_file_root(file_root)
+    except Exception:
+        # Do not leave a partially-bound cwd behind when the security root
+        # could not be installed. The caller must fail the request before
+        # agent/tool execution begins.
+        clear_session_cwd()
+        clear_session_file_root()
+        raise
+
     tokens = [
         _SESSION_PLATFORM.set(platform),
         _SESSION_SOURCE.set(source),
@@ -205,12 +225,6 @@ def set_session_vars(
         _SESSION_PROFILE.set(profile),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
     ]
-    try:
-        from agent.runtime_cwd import set_session_cwd
-
-        set_session_cwd(cwd)
-    except Exception:
-        pass
     return tokens
 
 
@@ -245,12 +259,10 @@ def clear_session_vars(tokens: list) -> None:
     # behavior (CLI / unaware paths), not be mistaken for an opted-out
     # stateless adapter.
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
-    try:
-        from agent.runtime_cwd import clear_session_cwd
+    from agent.runtime_cwd import clear_session_cwd, clear_session_file_root
 
-        clear_session_cwd()
-    except Exception:
-        pass
+    clear_session_cwd()
+    clear_session_file_root()
 
 
 def reset_session_vars() -> None:
@@ -293,12 +305,10 @@ def reset_session_vars() -> None:
     # same inheritance-leak reason as the mapped vars above — see clear_session_vars,
     # which resets this var on the handler-exit path for the symmetric concern.
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
-    try:
-        from agent.runtime_cwd import clear_session_cwd
+    from agent.runtime_cwd import clear_session_cwd, reset_session_file_root
 
-        clear_session_cwd()
-    except Exception:
-        pass
+    clear_session_cwd()
+    reset_session_file_root()
 
 
 def get_session_env(name: str, default: str = "") -> str:

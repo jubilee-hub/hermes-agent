@@ -210,6 +210,55 @@ class TestStartRun:
                 )
                 assert resp.status == 202
 
+    @pytest.mark.asyncio
+    async def test_start_run_binds_authenticated_session_root(
+        self,
+        auth_adapter,
+        tmp_path,
+    ):
+        root = tmp_path / "workspace"
+        root.mkdir()
+        observed = {}
+        ready = threading.Event()
+
+        class RootObservingAgent:
+            session_prompt_tokens = 0
+            session_completion_tokens = 0
+            session_total_tokens = 0
+
+            def run_conversation(self, **_kwargs):
+                from agent.runtime_cwd import resolve_agent_cwd, resolve_session_file_root
+
+                observed["agent_cwd"] = str(resolve_agent_cwd())
+                observed["file_root"] = str(resolve_session_file_root())
+                ready.set()
+                return {"final_response": "ok"}
+
+        app = _create_runs_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                auth_adapter,
+                "_create_agent",
+                return_value=RootObservingAgent(),
+            ):
+                resp = await cli.post(
+                    "/v1/runs",
+                    headers={
+                        "Authorization": "Bearer sk-secret",
+                        "X-Hermes-Session-Root": str(root),
+                    },
+                    json={"input": "hello"},
+                )
+                completed = await asyncio.to_thread(ready.wait, 5)
+
+        assert resp.status == 202
+        assert "X-Hermes-Session-Root" not in resp.headers
+        assert completed is True
+        assert observed == {
+            "agent_cwd": str(root),
+            "file_root": str(root),
+        }
+
 
 # ---------------------------------------------------------------------------
 # GET /v1/runs/{run_id} — poll run status
