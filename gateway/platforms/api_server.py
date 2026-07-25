@@ -8,6 +8,7 @@ Exposes an HTTP server with endpoints:
 - DELETE /v1/responses/{response_id} — Delete a stored response
 - GET  /v1/models                  — lists hermes-agent and any configured model_routes aliases
 - GET  /v1/capabilities            — machine-readable API capabilities for external UIs
+- POST /v1/session-root-canary     — authenticated Agent SaaS file-root enforcement probe
 - GET  /api/sessions               — list client-visible Hermes sessions
 - POST /api/sessions               — create an empty Hermes session
 - GET/PATCH/DELETE /api/sessions/{session_id} — read/update/delete a session
@@ -51,7 +52,9 @@ import logging
 import os
 import re
 import sqlite3
+import shutil
 import sys
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -125,6 +128,7 @@ MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversation
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+_SESSION_ROOT_CANARY_BASE = Path("/workspace")
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -1503,6 +1507,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/health", self._handle_health),
             ("GET", "/v1/models", self._handle_models),
             ("GET", "/v1/capabilities", self._handle_capabilities),
+            ("POST", "/v1/session-root-canary", self._handle_session_root_canary),
             ("GET", "/v1/skills", self._handle_skills),
             ("GET", "/v1/toolsets", self._handle_toolsets),
             ("GET", "/api/sessions", self._handle_list_sessions),
@@ -2061,6 +2066,170 @@ class APIServerAdapter(BasePlatformAdapter):
             })
 
         return web.json_response({"object": "list", "data": models})
+
+    async def _handle_session_root_canary(
+        self,
+        request: "web.Request",
+    ) -> "web.Response":
+        """Exercise the real file tools against an isolated throwaway root.
+
+        Agent SaaS uses this API-key-protected endpoint as runtime evidence
+        that Session Root enforcement is active. The caller cannot choose a
+        path, and every probe uses unique private directories under the
+        mounted workspace so overlapping checks cannot share files.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        root: Optional[Path] = None
+        outside: Optional[Path] = None
+        relative_escape: Optional[Path] = None
+        session_root_bound = False
+        try:
+            from agent.runtime_cwd import (
+                clear_session_file_root,
+                set_session_file_root,
+            )
+            from tools.file_tools import (
+                read_file_tool,
+                search_tool,
+                write_file_tool,
+            )
+
+            root = Path(tempfile.mkdtemp(
+                prefix=".agent-saas-canary-root-",
+                dir=_SESSION_ROOT_CANARY_BASE,
+            ))
+            outside = Path(tempfile.mkdtemp(
+                prefix=".agent-saas-canary-outside-",
+                dir=_SESSION_ROOT_CANARY_BASE,
+            ))
+            relative_escape = root.parent / f"{root.name}-relative-escape.md"
+            marker = f"canary-{uuid.uuid4().hex}"
+            task_id = "agent-saas-session-root-canary"
+
+            def _parse_tool_result(value: str) -> Dict[str, Any]:
+                try:
+                    parsed = json.loads(value)
+                except (TypeError, ValueError):
+                    return {"error": "invalid tool result"}
+                return parsed if isinstance(parsed, dict) else {"error": "invalid tool result"}
+
+            def _denied(value: str, target: Path) -> bool:
+                parsed = _parse_tool_result(value)
+                return bool(parsed.get("error")) and not target.exists()
+
+            set_session_file_root(str(root))
+            session_root_bound = True
+
+            inside = root / "inside.md"
+            written = _parse_tool_result(
+                write_file_tool(
+                    "inside.md",
+                    f"{marker}\n",
+                    task_id=task_id,
+                )
+            )
+            read_back = _parse_tool_result(
+                read_file_tool("inside.md", task_id=task_id)
+            )
+            checks: Dict[str, bool] = {
+                "allowedWriteInsideRoot": (
+                    not written.get("error") and inside.is_file()
+                ),
+                "allowedReadInsideRoot": (
+                    not read_back.get("error")
+                    and marker in json.dumps(read_back, ensure_ascii=False)
+                ),
+                "relativeEscapeDenied": _denied(
+                    write_file_tool(
+                        f"../{relative_escape.name}",
+                        "x\n",
+                        task_id=task_id,
+                    ),
+                    relative_escape,
+                ),
+                "absoluteEscapeDenied": _denied(
+                    write_file_tool(
+                        str(outside / "absolute-escape.md"),
+                        "x\n",
+                        task_id=task_id,
+                    ),
+                    outside / "absolute-escape.md",
+                ),
+            }
+
+            symlink_created = False
+            try:
+                (root / "link").symlink_to(outside, target_is_directory=True)
+                symlink_created = True
+            except OSError:
+                pass
+            checks["symlinkEscapeDenied"] = symlink_created and _denied(
+                write_file_tool(
+                    "link/symlink-escape.md",
+                    "x\n",
+                    task_id=task_id,
+                ),
+                outside / "symlink-escape.md",
+            )
+            outside_marker = f"{marker}-outside"
+            (outside / "search-leak.md").write_text(
+                f"{outside_marker}\n",
+                encoding="utf-8",
+            )
+            search_result = _parse_tool_result(
+                search_tool(
+                    marker,
+                    path=".",
+                    task_id=task_id,
+                )
+            )
+            serialized_search = json.dumps(search_result, ensure_ascii=False)
+            # Both safe implementations are accepted: reject the whole tree,
+            # or search the real inside file while skipping the escaping link.
+            checks["searchTreeEscapeDenied"] = symlink_created and (
+                bool(search_result.get("error"))
+                or (
+                    marker in serialized_search
+                    and outside_marker not in serialized_search
+                )
+            )
+
+            required = (
+                "allowedWriteInsideRoot",
+                "allowedReadInsideRoot",
+                "relativeEscapeDenied",
+                "absoluteEscapeDenied",
+                "symlinkEscapeDenied",
+                "searchTreeEscapeDenied",
+            )
+            return web.json_response({
+                "object": "hermes.session_root_canary",
+                "enforced": all(checks.get(name) is True for name in required),
+                "checks": checks,
+            })
+        except Exception:
+            logger.exception("Session Root canary failed")
+            return web.json_response(
+                {"error": "session_root_canary_failed"},
+                status=500,
+            )
+        finally:
+            try:
+                if session_root_bound:
+                    clear_session_file_root()
+            finally:
+                if root is not None:
+                    shutil.rmtree(root, ignore_errors=True)
+                if outside is not None:
+                    shutil.rmtree(outside, ignore_errors=True)
+                if relative_escape is not None:
+                    try:
+                        relative_escape.unlink(missing_ok=True)
+                    except OSError:
+                        pass
 
     async def _handle_capabilities(self, request: "web.Request") -> "web.Response":
         """GET /v1/capabilities — advertise the stable API surface.
