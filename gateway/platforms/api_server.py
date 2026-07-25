@@ -2174,6 +2174,21 @@ class APIServerAdapter(BasePlatformAdapter):
                 ),
                 outside / "symlink-escape.md",
             )
+            baseline_search = _parse_tool_result(
+                search_tool(
+                    marker,
+                    path=".",
+                    task_id=task_id,
+                )
+            )
+            serialized_baseline = json.dumps(
+                baseline_search,
+                ensure_ascii=False,
+            )
+            baseline_search_works = (
+                not baseline_search.get("error")
+                and marker in serialized_baseline
+            )
             outside_marker = f"{marker}-outside"
             (outside / "search-leak.md").write_text(
                 f"{outside_marker}\n",
@@ -2189,11 +2204,15 @@ class APIServerAdapter(BasePlatformAdapter):
             serialized_search = json.dumps(search_result, ensure_ascii=False)
             # Both safe implementations are accepted: reject the whole tree,
             # or search the real inside file while skipping the escaping link.
-            checks["searchTreeEscapeDenied"] = symlink_created and (
-                bool(search_result.get("error"))
-                or (
-                    marker in serialized_search
-                    and outside_marker not in serialized_search
+            checks["searchTreeEscapeDenied"] = (
+                symlink_created
+                and baseline_search_works
+                and (
+                    bool(search_result.get("error"))
+                    or (
+                        marker in serialized_search
+                        and outside_marker not in serialized_search
+                    )
                 )
             )
 

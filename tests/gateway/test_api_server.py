@@ -1055,6 +1055,34 @@ class TestSessionRootCanaryEndpoint:
         assert list(workspace.iterdir()) == []
 
     @pytest.mark.asyncio
+    async def test_broken_search_cannot_masquerade_as_escape_denial(
+        self, auth_adapter, tmp_path, monkeypatch,
+    ):
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        monkeypatch.setattr(
+            "gateway.platforms.api_server._SESSION_ROOT_CANARY_BASE",
+            workspace,
+        )
+        monkeypatch.setattr(
+            "tools.file_tools.search_tool",
+            lambda *args, **kwargs: json.dumps({"error": "search unavailable"}),
+        )
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/session-root-canary",
+                json={},
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert data["enforced"] is False
+        assert data["checks"]["searchTreeEscapeDenied"] is False
+        assert list(workspace.iterdir()) == []
+
+    @pytest.mark.asyncio
     async def test_internal_failure_returns_generic_500_without_binding_root(
         self, auth_adapter, tmp_path, monkeypatch,
     ):
