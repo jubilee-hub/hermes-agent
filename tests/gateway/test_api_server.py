@@ -646,6 +646,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/health", adapter._handle_health)
     app.router.add_get("/v1/models", adapter._handle_models)
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
+    app.router.add_post("/v1/session-root-canary", adapter._handle_session_root_canary)
     app.router.add_get("/v1/skills", adapter._handle_skills)
     app.router.add_get("/v1/toolsets", adapter._handle_toolsets)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
@@ -959,6 +960,160 @@ class TestModelsEndpoint:
                 headers={"Authorization": "Bearer sk-secret"},
             )
             assert resp.status == 200
+
+
+# ---------------------------------------------------------------------------
+# /v1/session-root-canary endpoint
+# ---------------------------------------------------------------------------
+
+
+class TestSessionRootCanaryEndpoint:
+    @pytest.mark.asyncio
+    async def test_requires_api_key_when_configured(self, auth_adapter, tmp_path, monkeypatch):
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        monkeypatch.setattr(
+            "gateway.platforms.api_server._SESSION_ROOT_CANARY_BASE",
+            workspace,
+        )
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            unauthenticated = await cli.post("/v1/session-root-canary", json={})
+            assert unauthenticated.status == 401
+
+            authenticated = await cli.post(
+                "/v1/session-root-canary",
+                json={},
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            assert authenticated.status == 200
+
+    @pytest.mark.asyncio
+    async def test_runs_real_file_tools_and_cleans_probe_directories(
+        self, auth_adapter, tmp_path, monkeypatch,
+    ):
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        monkeypatch.setattr(
+            "gateway.platforms.api_server._SESSION_ROOT_CANARY_BASE",
+            workspace,
+        )
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/session-root-canary",
+                json={},
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert data["object"] == "hermes.session_root_canary"
+        for check, passed in data["checks"].items():
+            assert passed is True, check
+        assert data["enforced"] is True
+        assert data["checks"] == {
+            "allowedWriteInsideRoot": True,
+            "allowedReadInsideRoot": True,
+            "relativeEscapeDenied": True,
+            "absoluteEscapeDenied": True,
+            "symlinkEscapeDenied": True,
+            "searchTreeEscapeDenied": True,
+        }
+        assert list(workspace.iterdir()) == []
+
+        from agent.runtime_cwd import resolve_session_file_root
+
+        assert resolve_session_file_root() is None
+
+    @pytest.mark.asyncio
+    async def test_failed_check_is_reported_fail_closed_and_cleanup_still_runs(
+        self, auth_adapter, tmp_path, monkeypatch,
+    ):
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        monkeypatch.setattr(
+            "gateway.platforms.api_server._SESSION_ROOT_CANARY_BASE",
+            workspace,
+        )
+        monkeypatch.setattr(
+            "tools.file_tools.read_file_tool",
+            lambda *args, **kwargs: json.dumps({"error": "forced canary failure"}),
+        )
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/session-root-canary",
+                json={},
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert data["enforced"] is False
+        assert data["checks"]["allowedReadInsideRoot"] is False
+        assert list(workspace.iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_broken_search_cannot_masquerade_as_escape_denial(
+        self, auth_adapter, tmp_path, monkeypatch,
+    ):
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        monkeypatch.setattr(
+            "gateway.platforms.api_server._SESSION_ROOT_CANARY_BASE",
+            workspace,
+        )
+        monkeypatch.setattr(
+            "tools.file_tools.search_tool",
+            lambda *args, **kwargs: json.dumps({"error": "search unavailable"}),
+        )
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/session-root-canary",
+                json={},
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert data["enforced"] is False
+        assert data["checks"]["searchTreeEscapeDenied"] is False
+        assert list(workspace.iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_internal_failure_returns_generic_500_without_binding_root(
+        self, auth_adapter, tmp_path, monkeypatch,
+    ):
+        missing_workspace = tmp_path / "missing-workspace"
+        monkeypatch.setattr(
+            "gateway.platforms.api_server._SESSION_ROOT_CANARY_BASE",
+            missing_workspace,
+        )
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/session-root-canary",
+                json={},
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            data = await resp.json()
+
+        assert resp.status == 500
+        assert data == {"error": "session_root_canary_failed"}
+        assert str(missing_workspace) not in json.dumps(data)
+
+        from agent.runtime_cwd import resolve_session_file_root
+
+        assert resolve_session_file_root() is None
+
+    def test_production_route_table_includes_canary(self, adapter):
+        assert (
+            "POST",
+            "/v1/session-root-canary",
+            adapter._handle_session_root_canary,
+        ) in adapter._http_route_table()
 
 
 # ---------------------------------------------------------------------------
