@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 _UNSET: Any = object()
 
 _SESSION_CWD: ContextVar = ContextVar("HERMES_SESSION_CWD", default=_UNSET)
+_SESSION_FILE_ROOT: ContextVar = ContextVar("HERMES_SESSION_FILE_ROOT", default=_UNSET)
 
 # The Python package/source root (this file lives at <root>/agent/runtime_cwd.py).
 # When a backend is launched from, or self-spawns into, this tree (the desktop
@@ -50,11 +51,35 @@ def clear_session_cwd() -> None:
     _SESSION_CWD.set("")
 
 
+def set_session_file_root(root: str | None) -> Token:
+    """Pin the filesystem root enforced by file tools for this context."""
+    return _SESSION_FILE_ROOT.set((root or "").strip())
+
+
+def clear_session_file_root() -> None:
+    """Explicitly clear the request-scoped file root for this context."""
+    _SESSION_FILE_ROOT.set("")
+
+
+def reset_session_file_root() -> None:
+    """Restore the never-bound state for a freshly spawned session task."""
+    _SESSION_FILE_ROOT.set(_UNSET)
+
+
 def _session_cwd_override() -> str:
     value = _SESSION_CWD.get()
     if value is _UNSET:
         return ""
     return str(value).strip()
+
+
+def resolve_session_file_root() -> Path | None:
+    """Return the request-scoped root enforced by file tools, if configured."""
+    value = _SESSION_FILE_ROOT.get()
+    if value is _UNSET:
+        return None
+    root = str(value).strip()
+    return Path(root).expanduser() if root else None
 
 
 def resolve_agent_cwd() -> Path:
