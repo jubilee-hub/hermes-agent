@@ -1,4 +1,5 @@
 #!/command/with-contenv sh
+# shellcheck shell=sh
 # Prepare the Agent SaaS workspace volume after the image has applied any
 # HERMES_UID/HERMES_GID remapping. Only the mount root is changed: existing
 # tenant/workspace contents keep their current ownership.
