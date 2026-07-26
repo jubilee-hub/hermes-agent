@@ -129,6 +129,89 @@ CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 _SESSION_ROOT_CANARY_BASE = Path("/workspace")
+_SESSION_ROOT_ALLOWED_BASE = Path("/workspace")
+_SESSION_ROOT_DIRECTORY_MODE = 0o770
+_SESSION_ROOT_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+
+
+class _InvalidManagedSessionRoot(ValueError):
+    """The requested Session Root is outside the managed workspace contract."""
+
+
+class _UnavailableManagedSessionRoot(OSError):
+    """The managed workspace mount cannot initialize the requested root."""
+
+
+def _managed_session_root_parts(root_path: Path) -> tuple[str, ...]:
+    """Return validated path components below the managed workspace mount.
+
+    Agent SaaS owns the only supported root layout. Keeping the shape narrow
+    prevents an authenticated internal caller from turning this header into a
+    general-purpose directory creation primitive.
+    """
+    base = _SESSION_ROOT_ALLOWED_BASE
+    if not base.is_absolute():
+        raise _UnavailableManagedSessionRoot("Session root base is unavailable")
+    try:
+        relative = root_path.relative_to(base)
+    except ValueError as exc:
+        raise _InvalidManagedSessionRoot("Session root is outside the managed base") from exc
+
+    parts = relative.parts
+    if (
+        len(parts) != 4
+        or parts[0] != "profiles"
+        or parts[2] != "workspaces"
+        or not _SESSION_ROOT_UUID_RE.fullmatch(parts[1])
+        or not _SESSION_ROOT_UUID_RE.fullmatch(parts[3])
+    ):
+        raise _InvalidManagedSessionRoot("Session root has an unmanaged layout")
+    return parts
+
+
+def _initialize_managed_session_root(root_path: Path) -> None:
+    """Create a validated Session Root without following symlink components.
+
+    Every lookup is anchored to an already-open directory descriptor. A
+    concurrent initializer may win any mkdir race; the losing request simply
+    opens the directory that now exists. Existing directories and files are
+    never removed, replaced, chmodded, or otherwise mutated.
+    """
+    parts = _managed_session_root_parts(root_path)
+    open_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    current_fd: Optional[int] = None
+    try:
+        current_fd = os.open(_SESSION_ROOT_ALLOWED_BASE, open_flags)
+        for part in parts:
+            try:
+                next_fd = os.open(part, open_flags, dir_fd=current_fd)
+            except FileNotFoundError:
+                try:
+                    os.mkdir(
+                        part,
+                        mode=_SESSION_ROOT_DIRECTORY_MODE,
+                        dir_fd=current_fd,
+                    )
+                except FileExistsError:
+                    # Another authenticated request initialized this exact
+                    # component after our failed open.
+                    pass
+                next_fd = os.open(part, open_flags, dir_fd=current_fd)
+            os.close(current_fd)
+            current_fd = next_fd
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise _InvalidManagedSessionRoot(
+                "Session root contains an invalid path component"
+            ) from exc
+        raise _UnavailableManagedSessionRoot(
+            "Session root could not be initialized"
+        ) from exc
+    finally:
+        if current_fd is not None:
+            os.close(current_fd)
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -1652,7 +1735,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 _openai_error("Session root too long"),
                 status=400,
             )
-        root_path = Path(raw).expanduser()
+        root_path = Path(raw)
         if not root_path.is_absolute():
             return None, web.json_response(
                 _openai_error("Session root must be absolute"),
@@ -1663,7 +1746,25 @@ class APIServerAdapter(BasePlatformAdapter):
                 _openai_error("Session root must not contain '..' traversal"),
                 status=400,
             )
-        return raw, None
+        if raw != str(root_path):
+            return None, web.json_response(
+                _openai_error("Session root must use a canonical path"),
+                status=400,
+            )
+
+        try:
+            _initialize_managed_session_root(root_path)
+        except _InvalidManagedSessionRoot:
+            return None, web.json_response(
+                _openai_error("Invalid managed session root"),
+                status=400,
+            )
+        except _UnavailableManagedSessionRoot:
+            return None, web.json_response(
+                _openai_error("Managed session root is unavailable"),
+                status=503,
+            )
+        return str(root_path), None
 
     # ------------------------------------------------------------------
     # Session DB helper

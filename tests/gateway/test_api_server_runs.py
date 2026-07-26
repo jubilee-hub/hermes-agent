@@ -214,10 +214,22 @@ class TestStartRun:
     async def test_start_run_binds_authenticated_session_root(
         self,
         auth_adapter,
+        monkeypatch,
         tmp_path,
     ):
-        root = tmp_path / "workspace"
-        root.mkdir()
+        base = tmp_path / "workspace"
+        base.mkdir()
+        root = (
+            base
+            / "profiles"
+            / "00000000-0000-4000-8000-000000000200"
+            / "workspaces"
+            / "00000000-0000-4000-8000-000000000300"
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.api_server._SESSION_ROOT_ALLOWED_BASE",
+            base,
+        )
         observed = {}
         ready = threading.Event()
 
