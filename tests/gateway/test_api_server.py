@@ -795,7 +795,13 @@ class TestHealthDetailedEndpoint:
             "active_agents": 2,
             "exit_reason": None,
             "updated_at": "2026-04-14T00:00:00Z",
-        }), patch("gateway.run._resolve_gateway_model", return_value="test/model"):
+        }), patch(
+            "gateway.run._resolve_gateway_model",
+            return_value="test/model",
+        ), patch(
+            "gateway.readiness.shutil.disk_usage",
+            return_value=MagicMock(total=100, used=10, free=90),
+        ):
             async with TestClient(TestServer(app)) as cli:
                 resp = await cli.get("/health/detailed")
                 assert resp.status == 200
