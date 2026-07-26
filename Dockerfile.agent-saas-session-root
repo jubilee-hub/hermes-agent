@@ -11,14 +11,14 @@ FROM mirror.gcr.io/nousresearch/hermes-agent:v2026.7.20@sha256:f7b35053268f532f9
 ARG PATCH_REVISION
 
 LABEL org.opencontainers.image.source="https://github.com/jubilee-hub/hermes-agent" \
-      org.opencontainers.image.version="0.19.0-session-root" \
+      org.opencontainers.image.version="0.19.0-session-root-init" \
       org.opencontainers.image.revision="${PATCH_REVISION}" \
       org.opencontainers.image.base.name="docker.io/nousresearch/hermes-agent:v2026.7.20" \
       org.opencontainers.image.base.digest="sha256:f7b35053268f532f98955195c909f15a230470fbcbdacaa9fdecb95707dad04a" \
       io.jubilee.hermes.official-revision="3ef6bbd201263d354fd83ec55b3c306ded2eb72a" \
       io.jubilee.hermes.patch-revision="${PATCH_REVISION}" \
       io.jubilee.agent-saas.parent-issue="jubilee-hub/agent-saas#140" \
-      io.jubilee.agent-saas.image-issue="jubilee-hub/agent-saas#362"
+      io.jubilee.agent-saas.image-issue="jubilee-hub/agent-saas#700"
 
 # Only the four production modules and one startup permission hook required by
 # the Session Root / Artifact compatibility contract are overlaid. Everything

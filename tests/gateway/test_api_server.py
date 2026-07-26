@@ -13,6 +13,7 @@ Tests cover:
 """
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import stat
@@ -4137,6 +4138,247 @@ class TestSessionKeyHeader:
 
 
 class TestSessionRootHeader:
+    _PROFILE_ID = "00000000-0000-4000-8000-000000000200"
+    _WORKSPACE_ID = "00000000-0000-4000-8000-000000000300"
+
+    def _managed_root(self, base, *, profile_id=None, workspace_id=None):
+        return (
+            base
+            / "profiles"
+            / (profile_id or self._PROFILE_ID)
+            / "workspaces"
+            / (workspace_id or self._WORKSPACE_ID)
+        )
+
+    def test_session_root_initializes_missing_managed_root(
+        self,
+        auth_adapter,
+        monkeypatch,
+        tmp_path,
+    ):
+        base = tmp_path / "workspace"
+        base.mkdir()
+        root = self._managed_root(base)
+        monkeypatch.setattr(
+            "gateway.platforms.api_server._SESSION_ROOT_ALLOWED_BASE",
+            base,
+        )
+        request = MagicMock()
+        request.headers = {"X-Hermes-Session-Root": str(root)}
+
+        parsed, error = auth_adapter._parse_session_root_header(request)
+
+        assert error is None
+        assert parsed == str(root)
+        assert root.is_dir()
+
+    def test_session_root_initialization_preserves_existing_content(
+        self,
+        auth_adapter,
+        monkeypatch,
+        tmp_path,
+    ):
+        base = tmp_path / "workspace"
+        root = self._managed_root(base)
+        root.mkdir(parents=True)
+        marker = root / "existing.txt"
+        marker.write_text("keep me\n")
+        monkeypatch.setattr(
+            "gateway.platforms.api_server._SESSION_ROOT_ALLOWED_BASE",
+            base,
+        )
+        request = MagicMock()
+        request.headers = {"X-Hermes-Session-Root": str(root)}
+
+        parsed, error = auth_adapter._parse_session_root_header(request)
+
+        assert error is None
+        assert parsed == str(root)
+        assert marker.read_text() == "keep me\n"
+
+    def test_session_root_initialization_is_concurrently_idempotent(
+        self,
+        auth_adapter,
+        monkeypatch,
+        tmp_path,
+    ):
+        base = tmp_path / "workspace"
+        base.mkdir()
+        root = self._managed_root(base)
+        monkeypatch.setattr(
+            "gateway.platforms.api_server._SESSION_ROOT_ALLOWED_BASE",
+            base,
+        )
+
+        def initialize():
+            request = MagicMock()
+            request.headers = {"X-Hermes-Session-Root": str(root)}
+            return auth_adapter._parse_session_root_header(request)
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            results = list(executor.map(lambda _index: initialize(), range(24)))
+
+        assert all(parsed == str(root) and error is None for parsed, error in results)
+        assert root.is_dir()
+
+    @pytest.mark.parametrize(
+        "relative_parts",
+        [
+            ("other", _PROFILE_ID, "workspaces", _WORKSPACE_ID),
+            ("profiles", _PROFILE_ID, "other", _WORKSPACE_ID),
+            ("profiles", "not-a-uuid", "workspaces", _WORKSPACE_ID),
+            ("profiles", _PROFILE_ID, "workspaces", "not-a-uuid"),
+            ("profiles", _PROFILE_ID, "workspaces", _WORKSPACE_ID, "extra"),
+        ],
+    )
+    def test_session_root_rejects_unmanaged_layout(
+        self,
+        auth_adapter,
+        monkeypatch,
+        tmp_path,
+        relative_parts,
+    ):
+        base = tmp_path / "workspace"
+        base.mkdir()
+        root = base.joinpath(*relative_parts)
+        monkeypatch.setattr(
+            "gateway.platforms.api_server._SESSION_ROOT_ALLOWED_BASE",
+            base,
+        )
+        request = MagicMock()
+        request.headers = {"X-Hermes-Session-Root": str(root)}
+
+        parsed, error = auth_adapter._parse_session_root_header(request)
+
+        assert parsed is None
+        assert error is not None
+        assert error.status == 400
+        assert not root.exists()
+
+    def test_session_root_rejects_path_outside_managed_base(
+        self,
+        auth_adapter,
+        monkeypatch,
+        tmp_path,
+    ):
+        base = tmp_path / "workspace"
+        base.mkdir()
+        root = self._managed_root(tmp_path / "outside")
+        monkeypatch.setattr(
+            "gateway.platforms.api_server._SESSION_ROOT_ALLOWED_BASE",
+            base,
+        )
+        request = MagicMock()
+        request.headers = {"X-Hermes-Session-Root": str(root)}
+
+        parsed, error = auth_adapter._parse_session_root_header(request)
+
+        assert parsed is None
+        assert error is not None
+        assert error.status == 400
+        assert not root.exists()
+        assert str(root).encode() not in error.body
+
+    def test_session_root_fails_closed_when_managed_base_is_missing(
+        self,
+        auth_adapter,
+        monkeypatch,
+        tmp_path,
+    ):
+        base = tmp_path / "missing-workspace"
+        root = self._managed_root(base)
+        monkeypatch.setattr(
+            "gateway.platforms.api_server._SESSION_ROOT_ALLOWED_BASE",
+            base,
+        )
+        request = MagicMock()
+        request.headers = {"X-Hermes-Session-Root": str(root)}
+
+        parsed, error = auth_adapter._parse_session_root_header(request)
+
+        assert parsed is None
+        assert error is not None
+        assert error.status == 503
+        assert not root.exists()
+
+    def test_session_root_rejects_noncanonical_dot_component(
+        self,
+        auth_adapter,
+        monkeypatch,
+        tmp_path,
+    ):
+        base = tmp_path / "workspace"
+        base.mkdir()
+        root = self._managed_root(base)
+        raw = str(root.parent / "." / root.name).replace(
+            f"/workspaces/{root.name}",
+            f"/workspaces/./{root.name}",
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.api_server._SESSION_ROOT_ALLOWED_BASE",
+            base,
+        )
+        request = MagicMock()
+        request.headers = {"X-Hermes-Session-Root": raw}
+
+        parsed, error = auth_adapter._parse_session_root_header(request)
+
+        assert parsed is None
+        assert error is not None
+        assert error.status == 400
+        assert not root.exists()
+
+    def test_session_root_rejects_symlink_parent_without_writing_target(
+        self,
+        auth_adapter,
+        monkeypatch,
+        tmp_path,
+    ):
+        base = tmp_path / "workspace"
+        base.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (base / "profiles").symlink_to(outside, target_is_directory=True)
+        root = self._managed_root(base)
+        monkeypatch.setattr(
+            "gateway.platforms.api_server._SESSION_ROOT_ALLOWED_BASE",
+            base,
+        )
+        request = MagicMock()
+        request.headers = {"X-Hermes-Session-Root": str(root)}
+
+        parsed, error = auth_adapter._parse_session_root_header(request)
+
+        assert parsed is None
+        assert error is not None
+        assert error.status == 400
+        assert list(outside.iterdir()) == []
+
+    def test_session_root_rejects_symlink_managed_base(
+        self,
+        auth_adapter,
+        monkeypatch,
+        tmp_path,
+    ):
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        base = tmp_path / "workspace"
+        base.symlink_to(outside, target_is_directory=True)
+        root = self._managed_root(base)
+        monkeypatch.setattr(
+            "gateway.platforms.api_server._SESSION_ROOT_ALLOWED_BASE",
+            base,
+        )
+        request = MagicMock()
+        request.headers = {"X-Hermes-Session-Root": str(root)}
+
+        parsed, error = auth_adapter._parse_session_root_header(request)
+
+        assert parsed is None
+        assert error is not None
+        assert error.status == 400
+        assert list(outside.iterdir()) == []
+
     @pytest.mark.parametrize(
         ("endpoint", "body"),
         [
@@ -4163,9 +4405,22 @@ class TestSessionRootHeader:
         body,
     ):
         monkeypatch.setattr("tools.file_tools._SENSITIVE_PATH_PREFIXES", ())
-        roots = [tmp_path / "user-a", tmp_path / "user-b"]
-        for root in roots:
-            root.mkdir()
+        base = tmp_path / "workspace"
+        base.mkdir()
+        monkeypatch.setattr(
+            "gateway.platforms.api_server._SESSION_ROOT_ALLOWED_BASE",
+            base,
+        )
+        roots = [
+            self._managed_root(
+                base,
+                workspace_id="00000000-0000-4000-8000-000000000300",
+            ),
+            self._managed_root(
+                base,
+                workspace_id="00000000-0000-4000-8000-000000000301",
+            ),
+        ]
         run_count = 0
 
         class RootWritingAgent:
@@ -4220,17 +4475,23 @@ class TestSessionRootHeader:
                     assert resp.status == 200
 
         assert run_count == 2
-        assert (roots[0] / "idempotency-proof.txt").read_text() == "user-a\n"
-        assert (roots[1] / "idempotency-proof.txt").read_text() == "user-b\n"
+        assert (roots[0] / "idempotency-proof.txt").read_text() == f"{roots[0].name}\n"
+        assert (roots[1] / "idempotency-proof.txt").read_text() == f"{roots[1].name}\n"
 
     @pytest.mark.asyncio
     async def test_responses_named_conversation_retry_remains_idempotent(
         self,
         auth_adapter,
+        monkeypatch,
         tmp_path,
     ):
-        root = tmp_path / "workspace"
-        root.mkdir()
+        base = tmp_path / "workspace"
+        base.mkdir()
+        root = self._managed_root(base)
+        monkeypatch.setattr(
+            "gateway.platforms.api_server._SESSION_ROOT_ALLOWED_BASE",
+            base,
+        )
         body = {
             "model": "hermes-agent",
             "input": "write once",
@@ -4271,14 +4532,22 @@ class TestSessionRootHeader:
 
         assert mock_run.await_count == 1
 
+    @pytest.mark.parametrize("stream", [False, True])
     @pytest.mark.asyncio
     async def test_chat_completions_passes_authenticated_root_without_echo(
         self,
         auth_adapter,
+        monkeypatch,
         tmp_path,
+        stream,
     ):
-        root = tmp_path / "workspace"
-        root.mkdir()
+        base = tmp_path / "workspace"
+        base.mkdir()
+        root = self._managed_root(base)
+        monkeypatch.setattr(
+            "gateway.platforms.api_server._SESSION_ROOT_ALLOWED_BASE",
+            base,
+        )
         mock_result = {"final_response": "ok", "messages": [], "api_calls": 1}
         app = _create_app(auth_adapter)
 
@@ -4297,8 +4566,10 @@ class TestSessionRootHeader:
                     json={
                         "model": "hermes-agent",
                         "messages": [{"role": "user", "content": "hi"}],
+                        "stream": stream,
                     },
                 )
+                await resp.read()
 
         assert resp.status == 200
         assert "X-Hermes-Session-Root" not in resp.headers
@@ -4350,10 +4621,22 @@ class TestSessionRootHeader:
         assert error is not None
         assert error.status == 501
 
+    @pytest.mark.parametrize("stream", [False, True])
     @pytest.mark.asyncio
-    async def test_responses_passes_authenticated_root(self, auth_adapter, tmp_path):
-        root = tmp_path / "workspace"
-        root.mkdir()
+    async def test_responses_passes_authenticated_root(
+        self,
+        auth_adapter,
+        monkeypatch,
+        tmp_path,
+        stream,
+    ):
+        base = tmp_path / "workspace"
+        base.mkdir()
+        root = self._managed_root(base)
+        monkeypatch.setattr(
+            "gateway.platforms.api_server._SESSION_ROOT_ALLOWED_BASE",
+            base,
+        )
         mock_result = {"final_response": "ok", "messages": [], "api_calls": 1}
         app = _create_app(auth_adapter)
 
@@ -4369,17 +4652,33 @@ class TestSessionRootHeader:
                         "Authorization": "Bearer sk-secret",
                         "X-Hermes-Session-Root": str(root),
                     },
-                    json={"model": "hermes-agent", "input": "hello", "store": False},
+                    json={
+                        "model": "hermes-agent",
+                        "input": "hello",
+                        "store": False,
+                        "stream": stream,
+                    },
                 )
+                await resp.read()
 
         assert resp.status == 200
         assert "X-Hermes-Session-Root" not in resp.headers
         assert mock_run.call_args.kwargs["session_root"] == str(root)
 
     @pytest.mark.asyncio
-    async def test_session_root_requires_configured_api_key(self, adapter, tmp_path):
-        root = tmp_path / "workspace"
-        root.mkdir()
+    async def test_session_root_requires_configured_api_key(
+        self,
+        adapter,
+        monkeypatch,
+        tmp_path,
+    ):
+        base = tmp_path / "workspace"
+        base.mkdir()
+        root = self._managed_root(base)
+        monkeypatch.setattr(
+            "gateway.platforms.api_server._SESSION_ROOT_ALLOWED_BASE",
+            base,
+        )
         app = _create_app(adapter)
 
         async with TestClient(TestServer(app)) as cli:
@@ -4393,6 +4692,33 @@ class TestSessionRootHeader:
             )
 
         assert resp.status == 403
+        assert not root.exists()
+
+    @pytest.mark.asyncio
+    async def test_session_root_requires_valid_bearer_before_initializing(
+        self,
+        auth_adapter,
+        monkeypatch,
+        tmp_path,
+    ):
+        base = tmp_path / "workspace"
+        base.mkdir()
+        root = self._managed_root(base)
+        monkeypatch.setattr(
+            "gateway.platforms.api_server._SESSION_ROOT_ALLOWED_BASE",
+            base,
+        )
+        app = _create_app(auth_adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/responses",
+                headers={"X-Hermes-Session-Root": str(root)},
+                json={"model": "hermes-agent", "input": "hello", "store": False},
+            )
+
+        assert resp.status == 401
+        assert not root.exists()
 
     def test_session_root_rejects_control_characters(self, auth_adapter):
         request = MagicMock()

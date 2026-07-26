@@ -220,9 +220,24 @@ async def test_concurrent_api_runs_keep_session_roots_isolated(adapter, monkeypa
 
 
 @pytest.mark.asyncio
-async def test_session_chat_passes_authenticated_session_root(auth_adapter, tmp_path):
-    root = tmp_path / "workspace"
-    root.mkdir()
+async def test_session_chat_passes_authenticated_session_root(
+    auth_adapter,
+    monkeypatch,
+    tmp_path,
+):
+    base = tmp_path / "workspace"
+    base.mkdir()
+    root = (
+        base
+        / "profiles"
+        / "00000000-0000-4000-8000-000000000200"
+        / "workspaces"
+        / "00000000-0000-4000-8000-000000000300"
+    )
+    monkeypatch.setattr(
+        "gateway.platforms.api_server._SESSION_ROOT_ALLOWED_BASE",
+        base,
+    )
     app = _create_session_app(auth_adapter)
 
     async with TestClient(TestServer(app)) as cli:
@@ -255,10 +270,22 @@ async def test_session_chat_passes_authenticated_session_root(auth_adapter, tmp_
 @pytest.mark.asyncio
 async def test_session_chat_stream_passes_authenticated_session_root(
     auth_adapter,
+    monkeypatch,
     tmp_path,
 ):
-    root = tmp_path / "workspace"
-    root.mkdir()
+    base = tmp_path / "workspace"
+    base.mkdir()
+    root = (
+        base
+        / "profiles"
+        / "00000000-0000-4000-8000-000000000200"
+        / "workspaces"
+        / "00000000-0000-4000-8000-000000000300"
+    )
+    monkeypatch.setattr(
+        "gateway.platforms.api_server._SESSION_ROOT_ALLOWED_BASE",
+        base,
+    )
     app = _create_session_app(auth_adapter)
 
     async with TestClient(TestServer(app)) as cli:
