@@ -10,6 +10,7 @@ Supported environments:
 - "local": Execute directly on the host machine (default, fastest)
 - "docker": Execute in Docker containers (isolated, requires Docker)
 - "modal": Execute in Modal cloud sandboxes (direct Modal or managed gateway)
+- "sandbox_runner": Execute through the Agent SaaS host-local UDS Runner
 
 Features:
 - Multiple execution backends (local, docker, modal)
@@ -1318,7 +1319,9 @@ def _safe_getcwd() -> str:
 # cwd looks when it leaks toward a Linux container's ``-w`` flag.
 _HOST_CWD_PREFIXES = ("/Users/", "/home/", "C:\\", "C:/")
 
-_CONTAINER_BACKENDS = frozenset({"docker", "singularity", "modal", "daytona"})
+_CONTAINER_BACKENDS = frozenset(
+    {"docker", "singularity", "modal", "daytona", "sandbox_runner"}
+)
 
 
 def _is_ssh_remote_tilde_cwd(backend: str, cwd: str) -> bool:
@@ -1441,6 +1444,8 @@ def _get_env_config() -> Dict[str, Any]:
         default_cwd = _safe_getcwd()
     elif env_type == "ssh":
         default_cwd = "~"
+    elif env_type == "sandbox_runner":
+        default_cwd = "/workspace"
     else:
         default_cwd = "/root"
 
@@ -1544,7 +1549,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
     
     Args:
         env_type: One of "local", "docker", "singularity", "modal",
-            "daytona", "ssh"
+            "daytona", "sandbox_runner", "ssh"
         image: Docker/Singularity/Modal image name (ignored for local/ssh)
         cwd: Working directory
         timeout: Default command timeout
@@ -1667,6 +1672,37 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             persistent_filesystem=persistent, task_id=task_id,
         )
 
+    elif env_type == "sandbox_runner":
+        from tools.environments.sandbox_runner import (
+            DEFAULT_SOCKET_PATH,
+            DEFAULT_TOKEN_FD,
+            SandboxRunnerEnvironment,
+        )
+
+        overrides = resolve_task_overrides(task_id)
+        task_key = overrides.get("sandbox_task_key")
+        if not isinstance(task_key, str):
+            raise RuntimeError("Sandbox runner task identity is unavailable.")
+        raw_token_fd = os.getenv(
+            "HERMES_SANDBOX_RUNNER_TOKEN_FD",
+            str(DEFAULT_TOKEN_FD),
+        )
+        try:
+            token_fd = int(raw_token_fd)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("Sandbox runner credential is unavailable.") from exc
+        socket_path = os.getenv(
+            "HERMES_SANDBOX_RUNNER_SOCKET_PATH",
+            DEFAULT_SOCKET_PATH,
+        )
+        return SandboxRunnerEnvironment(
+            task_key=task_key,
+            socket_path=socket_path,
+            token_fd=token_fd,
+            cwd="/workspace",
+            timeout=timeout,
+        )
+
     elif env_type == "ssh":
         if not ssh_config or not ssh_config.get("host") or not ssh_config.get("user"):
             raise ValueError("SSH environment requires ssh_host and ssh_user to be configured")
@@ -1682,7 +1718,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
     else:
         raise ValueError(
             f"Unknown environment type: {env_type}. Use 'local', 'docker', "
-            f"'singularity', 'modal', 'daytona', or 'ssh'"
+            f"'singularity', 'modal', 'daytona', 'sandbox_runner', or 'ssh'"
         )
 
 
@@ -2210,6 +2246,35 @@ def terminal_tool(
         config = _get_env_config()
         env_type = resolve_task_env_type(task_id, config["env_type"])
 
+        if env_type == "sandbox_runner":
+            if background:
+                return json.dumps({
+                    "output": "",
+                    "exit_code": -1,
+                    "error": (
+                        "Background terminal processes are not supported by the "
+                        "bounded Sandbox Runner execution contract."
+                    ),
+                    "status": "blocked",
+                }, ensure_ascii=False)
+            if pty:
+                return json.dumps({
+                    "output": "",
+                    "exit_code": -1,
+                    "error": (
+                        "PTY terminal sessions are not supported by the bounded "
+                        "Sandbox Runner execution contract."
+                    ),
+                    "status": "blocked",
+                }, ensure_ascii=False)
+            if timeout is not None and timeout > 300:
+                return json.dumps({
+                    "output": "",
+                    "exit_code": -1,
+                    "error": "Sandbox Runner timeout cannot exceed 300 seconds.",
+                    "status": "blocked",
+                }, ensure_ascii=False)
+
         # Use task_id for environment isolation. By default all subagent
         # task_ids collapse back to "default" so the top-level agent and
         # every delegate_task child share one container; only task_ids with
@@ -2236,7 +2301,11 @@ def terminal_tool(
         else:
             image = ""
 
-        cwd = overrides.get("cwd") or get_session_cwd(task_id) or config["cwd"]
+        cwd = (
+            "/workspace"
+            if env_type == "sandbox_runner"
+            else (overrides.get("cwd") or get_session_cwd(task_id) or config["cwd"])
+        )
         # A per-task cwd override (registered by the gateway/TUI for workspace
         # tracking, or by RL/benchmark envs) wins over config["cwd"] — but
         # config["cwd"] was already sanitized for container backends in
