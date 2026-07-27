@@ -804,6 +804,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     compression_failure_error TEXT,
     compression_fallback_streak INTEGER NOT NULL DEFAULT 0,
     profile_name TEXT,
+    sandbox_context_hash TEXT,
     rewind_count INTEGER NOT NULL DEFAULT 0,
     archived INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
@@ -3256,6 +3257,47 @@ class SessionDB:
             )
             row = cursor.fetchone()
         return dict(row) if row else None
+
+    def bind_sandbox_context(
+        self,
+        session_id: str,
+        sandbox_context_hash: str,
+    ) -> bool:
+        """Atomically bind a session to one opaque sandbox context hash.
+
+        Only the digest is persisted. Rebinding the same digest is idempotent;
+        a different digest is rejected without modifying the session.
+        """
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", sandbox_context_hash):
+            raise ValueError("Invalid sandbox context hash")
+
+        def _do(conn: sqlite3.Connection) -> bool:
+            conn.execute(
+                """
+                INSERT INTO sessions (
+                    id, source, started_at, sandbox_context_hash
+                )
+                VALUES (?, 'api_server', ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    sandbox_context_hash = COALESCE(
+                        sessions.sandbox_context_hash,
+                        excluded.sandbox_context_hash
+                    )
+                WHERE sessions.sandbox_context_hash IS NULL
+                   OR sessions.sandbox_context_hash = excluded.sandbox_context_hash
+                """,
+                (session_id, time.time(), sandbox_context_hash),
+            )
+            row = conn.execute(
+                "SELECT sandbox_context_hash FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            return bool(
+                row
+                and row["sandbox_context_hash"] == sandbox_context_hash
+            )
+
+        return bool(self._execute_write(_do))
 
     def resolve_session_id(self, session_id_or_prefix: str) -> Optional[str]:
         """Resolve an exact or uniquely prefixed session ID to the full ID.

@@ -42,6 +42,7 @@ import threading
 import atexit
 import shutil
 import subprocess
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
@@ -1066,8 +1067,12 @@ def _maybe_reap_docker_orphans(container_config: Dict[str, Any]) -> None:
 # and fall back to the TERMINAL_MODAL_IMAGE (etc.) env var if no override is set.
 #
 # This is never exposed to the model -- only infrastructure code calls it.
-# Thread-safe because each task_id is unique per rollout.
+# A request-scoped lease may be shared by concurrent turns for the same
+# controlled sandbox identity, so access is protected and cleanup is
+# reference-counted.
 _task_env_overrides: Dict[str, Dict[str, Any]] = {}
+_task_env_override_leases: Dict[str, int] = {}
+_task_env_overrides_lock = threading.RLock()
 
 # ── Per-session cwd records (cwd rearchitecture, step 1) ────────────────────
 #
@@ -1133,12 +1138,15 @@ def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
         - modal_image: str -- Path to Dockerfile or Docker Hub image name
         - docker_image: str -- Docker image name
         - cwd: str -- Working directory inside the sandbox
+        - env_type: str -- Infrastructure-selected execution backend
+        - sandbox_task_key: str -- In-memory Runner capability; never log it
 
     Args:
         task_id: The rollout's unique task identifier
         overrides: Dict of config keys to override
     """
-    _task_env_overrides[task_id] = overrides
+    with _task_env_overrides_lock:
+        _task_env_overrides[task_id] = dict(overrides)
 
     # If a live environment already exists for this task, a freshly registered
     # ``cwd`` override (e.g. the ACP client switching the editor's project root
@@ -1168,8 +1176,43 @@ def clear_task_env_overrides(task_id: str):
 
     Called during cleanup to avoid stale entries accumulating.
     """
-    _task_env_overrides.pop(task_id, None)
+    with _task_env_overrides_lock:
+        _task_env_overrides.pop(task_id, None)
     clear_session_cwd(task_id)
+
+
+@contextmanager
+def scoped_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
+    """Lease task overrides for exactly one infrastructure-controlled turn.
+
+    Concurrent requests may legitimately target the same durable sandbox.
+    The first lease registers the override and the last lease clears it, so
+    one request finishing cannot make a sibling request fall back to the
+    process-wide execution backend.
+    """
+    requested = dict(overrides)
+    with _task_env_overrides_lock:
+        current = _task_env_overrides.get(task_id)
+        if current is not None and current != requested:
+            raise RuntimeError("Conflicting task environment override")
+        if current is None:
+            register_task_env_overrides(task_id, requested)
+        _task_env_override_leases[task_id] = (
+            _task_env_override_leases.get(task_id, 0) + 1
+        )
+    try:
+        yield
+    finally:
+        should_clear = False
+        with _task_env_overrides_lock:
+            remaining = _task_env_override_leases.get(task_id, 0) - 1
+            if remaining <= 0:
+                _task_env_override_leases.pop(task_id, None)
+                should_clear = True
+            else:
+                _task_env_override_leases[task_id] = remaining
+        if should_clear:
+            clear_task_env_overrides(task_id)
 
 
 def _resolve_container_task_id(task_id: Optional[str]) -> str:
@@ -1200,10 +1243,11 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
         "docker_image", "modal_image", "singularity_image",
         "daytona_image", "env_type",
     })
-    if task_id and task_id in _task_env_overrides:
-        overrides = _task_env_overrides[task_id]
-        if set(overrides.keys()) & _ISOLATION_KEYS:
-            return task_id
+    if task_id:
+        with _task_env_overrides_lock:
+            overrides = _task_env_overrides.get(task_id)
+            if overrides and set(overrides.keys()) & _ISOLATION_KEYS:
+                return task_id
     return "default"
 
 
@@ -1220,11 +1264,20 @@ def resolve_task_overrides(task_id: Optional[str]) -> Dict[str, Any]:
     source of that lookup so the terminal and file layers can't drift apart.
     """
     raw = task_id or "default"
-    return (
-        _task_env_overrides.get(raw)
-        or _task_env_overrides.get(_resolve_container_task_id(raw))
-        or {}
-    )
+    with _task_env_overrides_lock:
+        return dict(
+            _task_env_overrides.get(raw)
+            or _task_env_overrides.get(_resolve_container_task_id(raw))
+            or {}
+        )
+
+
+def resolve_task_env_type(task_id: Optional[str], default: str) -> str:
+    """Resolve the execution backend without silently dropping an override."""
+    override = resolve_task_overrides(task_id).get("env_type")
+    if isinstance(override, str) and override.strip():
+        return override.strip()
+    return default
 
 
 # Configuration from environment variables
@@ -2155,7 +2208,7 @@ def terminal_tool(
 
         # Get configuration
         config = _get_env_config()
-        env_type = config["env_type"]
+        env_type = resolve_task_env_type(task_id, config["env_type"])
 
         # Use task_id for environment isolation. By default all subagent
         # task_ids collapse back to "default" so the top-level agent and

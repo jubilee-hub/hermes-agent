@@ -24,10 +24,14 @@ from tools import terminal_tool
 def _clean_overrides():
     """Ensure no stray overrides from other tests leak in."""
     before = dict(terminal_tool._task_env_overrides)
+    before_leases = dict(terminal_tool._task_env_override_leases)
     terminal_tool._task_env_overrides.clear()
+    terminal_tool._task_env_override_leases.clear()
     yield
     terminal_tool._task_env_overrides.clear()
     terminal_tool._task_env_overrides.update(before)
+    terminal_tool._task_env_override_leases.clear()
+    terminal_tool._task_env_override_leases.update(before_leases)
 
 
 def test_none_task_id_maps_to_default():
@@ -151,3 +155,49 @@ def test_env_type_override_keeps_own_id():
         )
     finally:
         terminal_tool.clear_task_env_overrides("bench-env")
+
+
+def test_env_type_override_controls_backend_without_default_fallback():
+    terminal_tool.register_task_env_overrides(
+        "sandbox-v1-" + ("A" * 43),
+        {"env_type": "sandbox_runner"},
+    )
+    try:
+        assert terminal_tool.resolve_task_env_type(
+            "sandbox-v1-" + ("A" * 43),
+            "local",
+        ) == "sandbox_runner"
+        assert terminal_tool._resolve_container_task_id(
+            "sandbox-v1-" + ("A" * 43)
+        ) != "default"
+    finally:
+        terminal_tool.clear_task_env_overrides(
+            "sandbox-v1-" + ("A" * 43)
+        )
+
+
+def test_code_execution_uses_overridden_backend_instead_of_local(monkeypatch):
+    from tools import code_execution_tool
+
+    task_id = "sandbox-v1-" + ("B" * 43)
+    observed = []
+
+    def capture_backend(**kwargs):
+        observed.append(kwargs["env_type"])
+        raise RuntimeError("backend intentionally unavailable")
+
+    monkeypatch.setattr(terminal_tool, "_create_environment", capture_backend)
+    terminal_tool.register_task_env_overrides(
+        task_id,
+        {"env_type": "sandbox_runner"},
+    )
+    try:
+        with pytest.raises(
+            RuntimeError,
+            match="backend intentionally unavailable",
+        ):
+            code_execution_tool._get_or_create_env(task_id)
+    finally:
+        terminal_tool.clear_task_env_overrides(task_id)
+
+    assert observed == ["sandbox_runner"]
