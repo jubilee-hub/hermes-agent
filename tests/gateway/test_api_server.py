@@ -32,9 +32,16 @@ from gateway.platforms.api_server import (
     _IdempotencyCache,
     _derive_chat_session_id,
     _redact_api_error_text,
+    _session_root_file_ops_supported,
     check_api_server_requirements,
     cors_middleware,
     security_headers_middleware,
+)
+
+
+requires_session_root_file_ops = pytest.mark.skipif(
+    not _session_root_file_ops_supported(),
+    reason="descriptor-anchored Session Root file operations are unavailable",
 )
 
 
@@ -648,6 +655,8 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/models", adapter._handle_models)
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
     app.router.add_post("/v1/session-root-canary", adapter._handle_session_root_canary)
+    app.router.add_get("/v1/workspace/files", adapter._handle_workspace_files)
+    app.router.add_get("/v1/workspace/file", adapter._handle_workspace_file)
     app.router.add_get("/v1/skills", adapter._handle_skills)
     app.router.add_get("/v1/toolsets", adapter._handle_toolsets)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
@@ -4591,6 +4600,407 @@ class TestSessionRootHeader:
         assert resp.status == 200
         assert data["features"]["session_root_header"] == "X-Hermes-Session-Root"
 
+    @requires_session_root_file_ops
+    @pytest.mark.asyncio
+    async def test_capabilities_advertises_workspace_file_endpoints(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/capabilities")
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert data["endpoints"]["workspace_files"] == {
+            "method": "GET",
+            "path": "/v1/workspace/files",
+        }
+        assert data["endpoints"]["workspace_file"] == {
+            "method": "GET",
+            "path": "/v1/workspace/file",
+        }
+
+    @requires_session_root_file_ops
+    @pytest.mark.asyncio
+    async def test_workspace_files_lists_only_relative_regular_files(
+        self,
+        auth_adapter,
+        monkeypatch,
+        tmp_path,
+    ):
+        base = tmp_path / "workspace"
+        root = self._managed_root(base)
+        root.mkdir(parents=True)
+        (root / "proof.txt").write_text("proof\n")
+        nested = root / "nested"
+        nested.mkdir()
+        (nested / "result.md").write_text("result\n")
+        monkeypatch.setattr(
+            "gateway.platforms.api_server._SESSION_ROOT_ALLOWED_BASE",
+            base,
+        )
+        app = _create_app(auth_adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get(
+                "/v1/workspace/files",
+                headers={
+                    "Authorization": "Bearer sk-secret",
+                    "X-Hermes-Session-Root": str(root),
+                },
+            )
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert data["data"] == [
+            {"path": "nested/result.md", "sizeBytes": 7},
+            {"path": "proof.txt", "sizeBytes": 6},
+        ]
+
+    @requires_session_root_file_ops
+    @pytest.mark.asyncio
+    async def test_workspace_files_rejects_unrepresentable_truncation(
+        self,
+        auth_adapter,
+        monkeypatch,
+        tmp_path,
+    ):
+        base = tmp_path / "workspace"
+        root = self._managed_root(base)
+        for directory in (root / "a", root / "b"):
+            directory.mkdir(parents=True)
+            (directory / "one.txt").write_text("1")
+            (directory / "two.txt").write_text("2")
+        monkeypatch.setattr(
+            "gateway.platforms.api_server._SESSION_ROOT_ALLOWED_BASE",
+            base,
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.api_server._WORKSPACE_FILE_LIST_LIMIT",
+            2,
+        )
+        app = _create_app(auth_adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get(
+                "/v1/workspace/files",
+                headers={
+                    "Authorization": "Bearer sk-secret",
+                    "X-Hermes-Session-Root": str(root),
+                },
+            )
+            data = await resp.json()
+
+        assert resp.status == 413
+        assert data["error"]["message"] == "Workspace contains too many entries"
+
+    @requires_session_root_file_ops
+    @pytest.mark.asyncio
+    async def test_workspace_file_reads_exact_binary_content(
+        self,
+        auth_adapter,
+        monkeypatch,
+        tmp_path,
+    ):
+        base = tmp_path / "workspace"
+        root = self._managed_root(base)
+        root.mkdir(parents=True)
+        expected = b"Hermes workspace proof\n\x00binary"
+        (root / "proof.bin").write_bytes(expected)
+        monkeypatch.setattr(
+            "gateway.platforms.api_server._SESSION_ROOT_ALLOWED_BASE",
+            base,
+        )
+        app = _create_app(auth_adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get(
+                "/v1/workspace/file?path=proof.bin",
+                headers={
+                    "Authorization": "Bearer sk-secret",
+                    "X-Hermes-Session-Root": str(root),
+                },
+            )
+            body = await resp.read()
+
+        assert resp.status == 200
+        assert body == expected
+
+    @pytest.mark.parametrize(
+        "path",
+        ["../outside.txt", "/outside.txt", "nested//proof.txt", "./proof.txt"],
+    )
+    @requires_session_root_file_ops
+    @pytest.mark.asyncio
+    async def test_workspace_file_rejects_noncanonical_or_escaping_paths(
+        self,
+        auth_adapter,
+        monkeypatch,
+        tmp_path,
+        path,
+    ):
+        base = tmp_path / "workspace"
+        root = self._managed_root(base)
+        root.mkdir(parents=True)
+        monkeypatch.setattr(
+            "gateway.platforms.api_server._SESSION_ROOT_ALLOWED_BASE",
+            base,
+        )
+        app = _create_app(auth_adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get(
+                "/v1/workspace/file",
+                params={"path": path},
+                headers={
+                    "Authorization": "Bearer sk-secret",
+                    "X-Hermes-Session-Root": str(root),
+                },
+            )
+
+        assert resp.status == 400
+
+    @requires_session_root_file_ops
+    @pytest.mark.asyncio
+    async def test_workspace_file_endpoints_reject_symlinks_and_hardlinks(
+        self,
+        auth_adapter,
+        monkeypatch,
+        tmp_path,
+    ):
+        base = tmp_path / "workspace"
+        root = self._managed_root(base)
+        root.mkdir(parents=True)
+        outside = tmp_path / "outside.txt"
+        outside.write_text("outside\n")
+        (root / "linked.txt").symlink_to(outside)
+        os.link(outside, root / "hardlinked.txt")
+        monkeypatch.setattr(
+            "gateway.platforms.api_server._SESSION_ROOT_ALLOWED_BASE",
+            base,
+        )
+        app = _create_app(auth_adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            listed = await cli.get(
+                "/v1/workspace/files",
+                headers={
+                    "Authorization": "Bearer sk-secret",
+                    "X-Hermes-Session-Root": str(root),
+                },
+            )
+            listed_data = await listed.json()
+            linked = await cli.get(
+                "/v1/workspace/file?path=linked.txt",
+                headers={
+                    "Authorization": "Bearer sk-secret",
+                    "X-Hermes-Session-Root": str(root),
+                },
+            )
+            hardlinked = await cli.get(
+                "/v1/workspace/file?path=hardlinked.txt",
+                headers={
+                    "Authorization": "Bearer sk-secret",
+                    "X-Hermes-Session-Root": str(root),
+                },
+            )
+
+        assert listed.status == 200
+        assert listed_data == {"data": []}
+        assert linked.status == 403
+        assert hardlinked.status == 403
+
+    @requires_session_root_file_ops
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO is unavailable")
+    @pytest.mark.asyncio
+    async def test_workspace_file_rejects_fifo_without_blocking(
+        self,
+        auth_adapter,
+        monkeypatch,
+        tmp_path,
+    ):
+        base = tmp_path / "workspace"
+        root = self._managed_root(base)
+        root.mkdir(parents=True)
+        os.mkfifo(root / "pipe")
+        monkeypatch.setattr(
+            "gateway.platforms.api_server._SESSION_ROOT_ALLOWED_BASE",
+            base,
+        )
+        app = _create_app(auth_adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await asyncio.wait_for(
+                cli.get(
+                    "/v1/workspace/file?path=pipe",
+                    headers={
+                        "Authorization": "Bearer sk-secret",
+                        "X-Hermes-Session-Root": str(root),
+                    },
+                ),
+                timeout=1,
+            )
+
+        assert resp.status == 403
+
+    @requires_session_root_file_ops
+    @pytest.mark.asyncio
+    async def test_workspace_files_bounds_all_scanned_entries_and_depth(
+        self,
+        auth_adapter,
+        monkeypatch,
+        tmp_path,
+    ):
+        base = tmp_path / "workspace"
+        root = self._managed_root(base)
+        deep = root / "a" / "b"
+        deep.mkdir(parents=True)
+        (deep / "proof.txt").write_text("proof")
+        monkeypatch.setattr(
+            "gateway.platforms.api_server._SESSION_ROOT_ALLOWED_BASE",
+            base,
+        )
+        app = _create_app(auth_adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            monkeypatch.setattr(
+                "gateway.platforms.api_server._WORKSPACE_SCAN_ENTRY_LIMIT",
+                2,
+            )
+            entry_limited = await cli.get(
+                "/v1/workspace/files",
+                headers={
+                    "Authorization": "Bearer sk-secret",
+                    "X-Hermes-Session-Root": str(root),
+                },
+            )
+            monkeypatch.setattr(
+                "gateway.platforms.api_server._WORKSPACE_SCAN_ENTRY_LIMIT",
+                100,
+            )
+            monkeypatch.setattr(
+                "gateway.platforms.api_server._WORKSPACE_DIRECTORY_DEPTH_LIMIT",
+                1,
+            )
+            depth_limited = await cli.get(
+                "/v1/workspace/files",
+                headers={
+                    "Authorization": "Bearer sk-secret",
+                    "X-Hermes-Session-Root": str(root),
+                },
+            )
+
+        assert entry_limited.status == 413
+        assert depth_limited.status == 413
+
+    @requires_session_root_file_ops
+    @pytest.mark.asyncio
+    async def test_workspace_files_rejects_paths_that_read_cannot_represent(
+        self,
+        auth_adapter,
+        monkeypatch,
+        tmp_path,
+    ):
+        base = tmp_path / "workspace"
+        root = self._managed_root(base)
+        root.mkdir(parents=True)
+        (root / "proof.txt").write_text("proof")
+        monkeypatch.setattr(
+            "gateway.platforms.api_server._SESSION_ROOT_ALLOWED_BASE",
+            base,
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.api_server._WORKSPACE_RELATIVE_PATH_LIMIT",
+            5,
+        )
+        app = _create_app(auth_adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get(
+                "/v1/workspace/files",
+                headers={
+                    "Authorization": "Bearer sk-secret",
+                    "X-Hermes-Session-Root": str(root),
+                },
+            )
+
+        assert resp.status == 403
+
+    @requires_session_root_file_ops
+    @pytest.mark.asyncio
+    async def test_workspace_file_rejects_oversized_content(
+        self,
+        auth_adapter,
+        monkeypatch,
+        tmp_path,
+    ):
+        base = tmp_path / "workspace"
+        root = self._managed_root(base)
+        root.mkdir(parents=True)
+        (root / "large.bin").write_bytes(b"12345")
+        monkeypatch.setattr(
+            "gateway.platforms.api_server._SESSION_ROOT_ALLOWED_BASE",
+            base,
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.api_server._WORKSPACE_FILE_READ_LIMIT_BYTES",
+            4,
+        )
+        app = _create_app(auth_adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get(
+                "/v1/workspace/file?path=large.bin",
+                headers={
+                    "Authorization": "Bearer sk-secret",
+                    "X-Hermes-Session-Root": str(root),
+                },
+            )
+
+        assert resp.status == 413
+
+    @pytest.mark.parametrize("path", ["/v1/workspace/files", "/v1/workspace/file?path=proof.txt"])
+    @pytest.mark.asyncio
+    async def test_workspace_file_endpoints_authenticate_before_initializing_root(
+        self,
+        auth_adapter,
+        monkeypatch,
+        tmp_path,
+        path,
+    ):
+        base = tmp_path / "workspace"
+        base.mkdir()
+        root = self._managed_root(base)
+        monkeypatch.setattr(
+            "gateway.platforms.api_server._SESSION_ROOT_ALLOWED_BASE",
+            base,
+        )
+        app = _create_app(auth_adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get(
+                path,
+                headers={"X-Hermes-Session-Root": str(root)},
+            )
+
+        assert resp.status == 401
+        assert not root.exists()
+
+    @pytest.mark.parametrize("path", ["/v1/workspace/files", "/v1/workspace/file?path=proof.txt"])
+    @pytest.mark.asyncio
+    async def test_workspace_file_endpoints_require_session_root(
+        self,
+        auth_adapter,
+        path,
+    ):
+        app = _create_app(auth_adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get(
+                path,
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+
+        assert resp.status == 400
+
     @pytest.mark.asyncio
     async def test_capabilities_do_not_advertise_unsupported_session_root(
         self,
@@ -4608,6 +5018,8 @@ class TestSessionRootHeader:
 
         assert resp.status == 200
         assert data["features"]["session_root_header"] is False
+        assert "workspace_files" not in data["endpoints"]
+        assert "workspace_file" not in data["endpoints"]
 
     def test_session_root_rejects_unsupported_platform(
         self,
