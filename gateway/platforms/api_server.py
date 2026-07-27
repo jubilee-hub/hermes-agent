@@ -142,6 +142,7 @@ _WORKSPACE_DIRECTORY_DEPTH_LIMIT = 64
 _SESSION_ROOT_UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )
+_SANDBOX_TASK_KEY_RE = re.compile(r"^sandbox-v1-[A-Za-z0-9_-]{43}$")
 
 
 class _InvalidManagedSessionRoot(ValueError):
@@ -937,6 +938,24 @@ def _admit_api_agent_request(handler):
         draining = self._draining_response()
         if draining is not None:
             return draining
+        sandbox_task_key, sandbox_err = self._parse_sandbox_task_key_header(
+            request
+        )
+        if sandbox_err is not None:
+            return sandbox_err
+        if (
+            sandbox_task_key
+            and handler.__name__
+            not in {"_handle_chat_completions", "_handle_responses"}
+        ):
+            return web.json_response(
+                _openai_error(
+                    "This endpoint cannot safely execute a sandbox-scoped turn.",
+                    code="sandbox_endpoint_unsupported",
+                ),
+                status=503,
+            )
+        request["hermes_sandbox_task_key"] = sandbox_task_key
         reservation = {"active": True}
         token = _api_agent_request_reservation.set(reservation)
         self._pending_agent_requests += 1
@@ -1194,6 +1213,10 @@ class APIServerAdapter(BasePlatformAdapter):
             raw_port = os.getenv("API_SERVER_PORT", str(DEFAULT_PORT))
         self._port: int = _coerce_port(raw_port, DEFAULT_PORT)
         self._api_key: str = extra.get("key", os.getenv("API_SERVER_KEY", ""))
+        self._sandbox_task_key_required: bool = _coerce_request_bool(
+            extra.get("sandbox_task_key_required"),
+            default=False,
+        )
         self._cors_origins: tuple[str, ...] = self._parse_cors_origins(
             extra.get("cors_origins", os.getenv("API_SERVER_CORS_ORIGINS", "")),
         )
@@ -1839,6 +1862,128 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         return raw, None
+
+    def _parse_sandbox_task_key_header(
+        self,
+        request: "web.Request",
+    ) -> tuple[Optional[str], Optional["web.Response"]]:
+        """Validate the internal execution identity without echoing it.
+
+        The identity is accepted only on API-key-authenticated server-to-server
+        requests. It remains independent from the transcript/session identity.
+        """
+        raw = request.headers.get("X-Hermes-Sandbox-Task-Key", "").strip()
+        if not raw:
+            if self._sandbox_task_key_required:
+                return None, web.json_response(
+                    _openai_error(
+                        "Sandbox task identity is required.",
+                        code="sandbox_task_key_required",
+                    ),
+                    status=400,
+                )
+            return None, None
+
+        if not self._api_key:
+            return None, web.json_response(
+                _openai_error(
+                    "Sandbox task identity requires API key authentication.",
+                    code="sandbox_task_key_requires_auth",
+                ),
+                status=403,
+            )
+        if not _SANDBOX_TASK_KEY_RE.fullmatch(raw):
+            return None, web.json_response(
+                _openai_error(
+                    "Invalid sandbox task identity.",
+                    code="invalid_sandbox_task_key",
+                ),
+                status=400,
+            )
+
+        try:
+            from gateway.run import _load_gateway_config
+            from hermes_cli.tools_config import _get_platform_tools
+
+            enabled = _get_platform_tools(
+                _load_gateway_config(),
+                "api_server",
+            )
+        except Exception:
+            logger.exception(
+                "Could not verify tool policy for sandbox execution request"
+            )
+            return None, web.json_response(
+                _openai_error(
+                    "Sandbox execution policy is unavailable.",
+                    code="sandbox_policy_unavailable",
+                ),
+                status=503,
+            )
+        if "delegation" in enabled:
+            return None, web.json_response(
+                _openai_error(
+                    "Delegation is unavailable for sandbox execution.",
+                    code="sandbox_delegation_unsupported",
+                ),
+                status=503,
+            )
+        return raw, None
+
+    @staticmethod
+    def _sandbox_context_hash(sandbox_task_key: Optional[str]) -> Optional[str]:
+        if not sandbox_task_key:
+            return None
+        return "sha256:" + hashlib.sha256(
+            sandbox_task_key.encode("utf-8")
+        ).hexdigest()
+
+    @staticmethod
+    def _sandbox_execution_task_id(
+        sandbox_task_key: Optional[str],
+    ) -> Optional[str]:
+        """Return a non-secret task id suitable for logs and registries."""
+        if not sandbox_task_key:
+            return None
+        return "sandbox-task-" + hashlib.sha256(
+            sandbox_task_key.encode("utf-8")
+        ).hexdigest()
+
+    async def _bind_sandbox_session_context(
+        self,
+        session_id: str,
+        sandbox_context_hash: Optional[str],
+    ) -> Optional["web.Response"]:
+        """Fail closed if a transcript is reused by another sandbox."""
+        if not sandbox_context_hash:
+            return None
+        try:
+            db = await self._ensure_session_db_async()
+            if db is None:
+                raise RuntimeError("session database unavailable")
+            accepted = await asyncio.to_thread(
+                db.bind_sandbox_context,
+                session_id,
+                sandbox_context_hash,
+            )
+        except Exception:
+            logger.exception("Could not bind sandbox context to API session")
+            return web.json_response(
+                _openai_error(
+                    "Sandbox session context is unavailable.",
+                    code="sandbox_task_context_unavailable",
+                ),
+                status=503,
+            )
+        if not accepted:
+            return web.json_response(
+                _openai_error(
+                    "Session belongs to a different sandbox context.",
+                    code="sandbox_task_context_mismatch",
+                ),
+                status=409,
+            )
+        return None
 
     def _parse_session_root_header(
         self, request: "web.Request"
@@ -2517,13 +2662,24 @@ class APIServerAdapter(BasePlatformAdapter):
                 "required": bool(self._api_key),
             },
             "runtime": {
-                "mode": "server_agent",
-                "tool_execution": "server",
-                "split_runtime": False,
+                "mode": (
+                    "controlled_sandbox"
+                    if self._sandbox_task_key_required
+                    else "server_agent"
+                ),
+                "tool_execution": (
+                    "sandbox_runner_required"
+                    if self._sandbox_task_key_required
+                    else "server"
+                ),
+                "split_runtime": self._sandbox_task_key_required,
                 "description": (
+                    "Agent turns require a control-plane sandbox identity and "
+                    "execution is routed to the sandbox Runner."
+                    if self._sandbox_task_key_required
+                    else
                     "The API server creates a server-side Hermes AIAgent; "
-                    "tools execute on the API-server host unless a future "
-                    "explicit split-runtime mode is enabled."
+                    "tools execute on the API-server host."
                 ),
             },
             "features": {
@@ -2531,7 +2687,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "chat_completions_streaming": True,
                 "responses_api": True,
                 "responses_streaming": True,
-                "run_submission": True,
+                "run_submission": not self._sandbox_task_key_required,
                 "run_status": True,
                 "run_events_sse": True,
                 "run_stop": True,
@@ -2539,8 +2695,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "tool_progress_events": True,
                 "approval_events": True,
                 "session_resources": True,
-                "session_chat": True,
-                "session_chat_streaming": True,
+                "session_chat": not self._sandbox_task_key_required,
+                "session_chat_streaming": not self._sandbox_task_key_required,
                 "session_fork": True,
                 "admin_config_rw": False,
                 "jobs_admin": False,
@@ -2550,6 +2706,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 "realtime_voice": False,
                 "session_continuity_header": "X-Hermes-Session-Id",
                 "session_key_header": "X-Hermes-Session-Key",
+                "sandbox_task_key_header": "X-Hermes-Sandbox-Task-Key",
+                "sandbox_task_key_required": self._sandbox_task_key_required,
+                "sandbox_task_supported_endpoints": [
+                    "/v1/chat/completions",
+                    "/v1/responses",
+                ],
                 "session_root_header": (
                     "X-Hermes-Session-Root"
                     if workspace_files_supported
@@ -3328,6 +3490,8 @@ class APIServerAdapter(BasePlatformAdapter):
         session_root, root_err = self._parse_session_root_header(request)
         if root_err is not None:
             return root_err
+        sandbox_task_key = request.get("hermes_sandbox_task_key")
+        sandbox_context_hash = self._sandbox_context_hash(sandbox_task_key)
 
         # Allow caller to continue an existing session by passing X-Hermes-Session-Id.
         # When provided, history is loaded from state.db instead of from the request body.
@@ -3368,13 +3532,6 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=400,
                 )
             session_id = provided_session_id
-            try:
-                db = await self._ensure_session_db_async()
-                if db is not None:
-                    history = await asyncio.to_thread(db.get_messages_as_conversation, session_id)
-            except Exception as e:
-                logger.warning("Failed to load session history for %s: %s", session_id, e)
-                history = []
         else:
             # Derive a stable session ID from the conversation fingerprint so
             # that consecutive messages from the same Open WebUI (or similar)
@@ -3387,6 +3544,29 @@ class APIServerAdapter(BasePlatformAdapter):
                     break
             session_id = _derive_chat_session_id(system_prompt, first_user)
             # history already set from request body above
+
+        sandbox_bind_err = await self._bind_sandbox_session_context(
+            session_id,
+            sandbox_context_hash,
+        )
+        if sandbox_bind_err is not None:
+            return sandbox_bind_err
+
+        if provided_session_id:
+            try:
+                db = await self._ensure_session_db_async()
+                if db is not None:
+                    history = await asyncio.to_thread(
+                        db.get_messages_as_conversation,
+                        session_id,
+                    )
+            except Exception as e:
+                logger.warning(
+                    "Failed to load session history for %s: %s",
+                    session_id,
+                    e,
+                )
+                history = []
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", self._model_name)
@@ -3480,6 +3660,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
                 session_root=session_root,
+                sandbox_task_key=sandbox_task_key,
                 route=route,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
@@ -3501,6 +3682,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
                 session_root=session_root,
+                sandbox_task_key=sandbox_task_key,
                 route=route,
             )
 
@@ -3514,6 +3696,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "session_id": session_id,
                     "session_key": gateway_session_key,
                     "session_root": session_root,
+                    "sandbox_context": sandbox_context_hash,
                 },
             )
             try:
@@ -3826,6 +4009,7 @@ class APIServerAdapter(BasePlatformAdapter):
         store: bool,
         session_id: str,
         gateway_session_key: Optional[str] = None,
+        sandbox_context_hash: Optional[str] = None,
     ) -> "web.StreamResponse":
         """Write an SSE stream for POST /v1/responses (OpenAI Responses API).
 
@@ -3934,6 +4118,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "conversation_history": conversation_history_snapshot,
                 "instructions": instructions,
                 "session_id": session_id,
+                "sandbox_context_hash": sandbox_context_hash,
             })
             if conversation:
                 self._response_store.set_conversation(conversation, response_id)
@@ -4421,6 +4606,8 @@ class APIServerAdapter(BasePlatformAdapter):
         session_root, root_err = self._parse_session_root_header(request)
         if root_err is not None:
             return root_err
+        sandbox_task_key = request.get("hermes_sandbox_task_key")
+        sandbox_context_hash = self._sandbox_context_hash(sandbox_task_key)
 
         # Parse request body
         try:
@@ -4494,6 +4681,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 logger.debug("Both conversation_history and previous_response_id provided; using conversation_history")
 
         stored_session_id = None
+        stored = None
         if not conversation_history and previous_response_id:
             stored = self._response_store.get(previous_response_id)
             if stored is None:
@@ -4503,6 +4691,27 @@ class APIServerAdapter(BasePlatformAdapter):
             # If no instructions provided, carry forward from previous
             if instructions is None:
                 instructions = stored.get("instructions")
+        elif previous_response_id:
+            stored = self._response_store.get(previous_response_id)
+            if stored is None:
+                return web.json_response(
+                    _openai_error(
+                        f"Previous response not found: {previous_response_id}"
+                    ),
+                    status=404,
+                )
+
+        if (
+            stored is not None
+            and stored.get("sandbox_context_hash") != sandbox_context_hash
+        ):
+            return web.json_response(
+                _openai_error(
+                    "Previous response belongs to a different sandbox context.",
+                    code="sandbox_task_context_mismatch",
+                ),
+                status=409,
+            )
 
         # Append new input messages to history (all but the last become history)
         for msg in input_messages[:-1]:
@@ -4520,6 +4729,12 @@ class APIServerAdapter(BasePlatformAdapter):
         # Reuse session from previous_response_id chain so the dashboard
         # groups the entire conversation under one session entry.
         session_id = stored_session_id or str(uuid.uuid4())
+        sandbox_bind_err = await self._bind_sandbox_session_context(
+            session_id,
+            sandbox_context_hash,
+        )
+        if sandbox_bind_err is not None:
+            return sandbox_bind_err
 
         # Per-client model routing for /v1/responses (see model_routes).
         route = self._resolve_route(body.get("model"))
@@ -4578,6 +4793,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
                 session_root=session_root,
+                sandbox_task_key=sandbox_task_key,
                 route=route,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
@@ -4603,6 +4819,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 store=store,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                sandbox_context_hash=sandbox_context_hash,
             )
 
         async def _compute_response():
@@ -4613,6 +4830,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
                 session_root=session_root,
+                sandbox_task_key=sandbox_task_key,
                 route=route,
             )
 
@@ -4625,6 +4843,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "endpoint": "responses",
                     "session_key": gateway_session_key,
                     "session_root": session_root,
+                    "sandbox_context": sandbox_context_hash,
                 },
             )
             try:
@@ -4692,6 +4911,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "conversation_history": full_history,
                 "instructions": instructions,
                 "session_id": session_id,
+                "sandbox_context_hash": sandbox_context_hash,
             })
             # Update conversation mapping so the next request with the same
             # conversation name automatically chains to this response
@@ -5271,6 +5491,7 @@ class APIServerAdapter(BasePlatformAdapter):
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
         session_root: Optional[str] = None,
+        sandbox_task_key: Optional[str] = None,
         route: Optional[Dict[str, Any]] = None,
     ) -> tuple:
         """
@@ -5293,9 +5514,14 @@ class APIServerAdapter(BasePlatformAdapter):
         # run_in_executor threads, so the profile scope must be re-entered
         # inside _run() from this explicit value.
         request_profile = _api_request_profile.get()
+        sandbox_context_hash = self._sandbox_context_hash(sandbox_task_key)
+        sandbox_execution_task_id = self._sandbox_execution_task_id(
+            sandbox_task_key
+        )
 
         def _run():
             from gateway.session_context import clear_session_vars
+            from tools.terminal_tool import scoped_task_env_overrides
 
             with self._profile_scope(request_profile):
                 tokens = self._bind_api_server_session(
@@ -5305,36 +5531,84 @@ class APIServerAdapter(BasePlatformAdapter):
                     session_root=session_root or "",
                 )
                 try:
-                    agent = self._create_agent(
-                        ephemeral_system_prompt=ephemeral_system_prompt,
-                        session_id=session_id,
-                        stream_delta_callback=stream_delta_callback,
-                        tool_progress_callback=tool_progress_callback,
-                        tool_start_callback=tool_start_callback,
-                        tool_complete_callback=tool_complete_callback,
-                        gateway_session_key=gateway_session_key,
-                        route=route,
+                    if sandbox_context_hash:
+                        db = self._ensure_session_db()
+                        if (
+                            db is None
+                            or not db.bind_sandbox_context(
+                                session_id or "",
+                                sandbox_context_hash,
+                            )
+                        ):
+                            raise RuntimeError(
+                                "Sandbox session context is unavailable"
+                            )
+
+                    override_scope = (
+                        scoped_task_env_overrides(
+                            sandbox_execution_task_id,
+                            {
+                                "env_type": "sandbox_runner",
+                                "sandbox_task_key": sandbox_task_key,
+                            },
+                        )
+                        if sandbox_execution_task_id
+                        else nullcontext()
                     )
-                    if agent_ref is not None:
-                        agent_ref[0] = agent
-                    effective_task_id = session_id or str(uuid.uuid4())
-                    result = agent.run_conversation(
-                        user_message=user_message,
-                        conversation_history=conversation_history,
-                        task_id=effective_task_id,
-                    )
-                    usage = {
-                        "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
-                        "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
-                        "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
-                    }
-                    # Include the effective session ID in the result so callers
-                    # (e.g. X-Hermes-Session-Id header) can track compression-
-                    # triggered session rotations. (#16938)
-                    _eff_sid = getattr(agent, "session_id", session_id)
-                    if isinstance(_eff_sid, str) and _eff_sid:
-                        result["session_id"] = _eff_sid
-                    return result, usage
+                    with override_scope:
+                        agent = self._create_agent(
+                            ephemeral_system_prompt=ephemeral_system_prompt,
+                            session_id=session_id,
+                            stream_delta_callback=stream_delta_callback,
+                            tool_progress_callback=tool_progress_callback,
+                            tool_start_callback=tool_start_callback,
+                            tool_complete_callback=tool_complete_callback,
+                            gateway_session_key=gateway_session_key,
+                            route=route,
+                        )
+                        if agent_ref is not None:
+                            agent_ref[0] = agent
+                        effective_task_id = (
+                            sandbox_execution_task_id
+                            or session_id
+                            or str(uuid.uuid4())
+                        )
+                        result = agent.run_conversation(
+                            user_message=user_message,
+                            conversation_history=conversation_history,
+                            task_id=effective_task_id,
+                        )
+                        usage = {
+                            "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
+                            "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
+                            "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
+                        }
+                        # Include the effective session ID in the result so callers
+                        # (e.g. X-Hermes-Session-Id header) can track compression-
+                        # triggered session rotations. (#16938)
+                        _eff_sid = getattr(agent, "session_id", session_id)
+                        if isinstance(_eff_sid, str) and _eff_sid:
+                            if (
+                                sandbox_context_hash
+                                and _eff_sid != session_id
+                            ):
+                                db = self._ensure_session_db()
+                                if (
+                                    db is None
+                                    or not db.bind_sandbox_context(
+                                        _eff_sid,
+                                        sandbox_context_hash,
+                                    )
+                                ):
+                                    raise RuntimeError(
+                                        "Sandbox session context is unavailable"
+                                    )
+                            result["session_id"] = _eff_sid
+                        return result, usage
+                except Exception:
+                    if sandbox_task_key:
+                        raise RuntimeError("Sandbox execution failed") from None
+                    raise
                 finally:
                     clear_session_vars(tokens)
 
