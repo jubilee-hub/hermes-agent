@@ -9,6 +9,8 @@ Exposes an HTTP server with endpoints:
 - GET  /v1/models                  — lists hermes-agent and any configured model_routes aliases
 - GET  /v1/capabilities            — machine-readable API capabilities for external UIs
 - POST /v1/session-root-canary     — authenticated Agent SaaS file-root enforcement probe
+- GET  /v1/workspace/files        — list regular files below the authenticated Session Root
+- GET  /v1/workspace/file         — read one regular file below the authenticated Session Root
 - GET  /api/sessions               — list client-visible Hermes sessions
 - POST /api/sessions               — create an empty Hermes session
 - GET/PATCH/DELETE /api/sessions/{session_id} — read/update/delete a session
@@ -53,11 +55,12 @@ import os
 import re
 import sqlite3
 import shutil
+import stat
 import sys
 import tempfile
 import time
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Optional
 
 # Sentinel returned by _resolve_request_profile when a /p/<profile>/ prefix
@@ -131,6 +134,11 @@ MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 _SESSION_ROOT_CANARY_BASE = Path("/workspace")
 _SESSION_ROOT_ALLOWED_BASE = Path("/workspace")
 _SESSION_ROOT_DIRECTORY_MODE = 0o770
+_WORKSPACE_FILE_LIST_LIMIT = 4096
+_WORKSPACE_FILE_READ_LIMIT_BYTES = 32 * 1024 * 1024
+_WORKSPACE_RELATIVE_PATH_LIMIT = 4096
+_WORKSPACE_SCAN_ENTRY_LIMIT = 16384
+_WORKSPACE_DIRECTORY_DEPTH_LIMIT = 64
 _SESSION_ROOT_UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )
@@ -212,6 +220,138 @@ def _initialize_managed_session_root(root_path: Path) -> None:
     finally:
         if current_fd is not None:
             os.close(current_fd)
+
+
+def _open_managed_session_root_fd(root_path: Path) -> int:
+    """Open a managed Session Root without following any path component."""
+    parts = _managed_session_root_parts(root_path)
+    open_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    current_fd: Optional[int] = None
+    try:
+        current_fd = os.open(_SESSION_ROOT_ALLOWED_BASE, open_flags)
+        for part in parts:
+            next_fd = os.open(part, open_flags, dir_fd=current_fd)
+            os.close(current_fd)
+            current_fd = next_fd
+        result = current_fd
+        current_fd = None
+        return result
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise PermissionError("Workspace path is unsafe") from exc
+        raise
+    finally:
+        if current_fd is not None:
+            os.close(current_fd)
+
+
+def _list_managed_workspace_files(root_path: Path) -> List[Dict[str, Any]]:
+    """List regular workspace files through descriptor-anchored traversal."""
+    root_fd = _open_managed_session_root_fd(root_path)
+    rows: List[Dict[str, Any]] = []
+    scanned_entries = 0
+
+    def walk(directory_fd: int, prefix: tuple[str, ...], depth: int) -> None:
+        nonlocal scanned_entries
+        if depth > _WORKSPACE_DIRECTORY_DEPTH_LIMIT:
+            raise OverflowError("Workspace directory tree is too deep")
+        with os.scandir(directory_fd) as entries:
+            for entry in entries:
+                scanned_entries += 1
+                if scanned_entries > _WORKSPACE_SCAN_ENTRY_LIMIT:
+                    raise OverflowError("Workspace contains too many entries")
+                name = entry.name
+                try:
+                    metadata = entry.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                relative = "/".join((*prefix, name))
+                if stat.S_ISLNK(metadata.st_mode):
+                    continue
+                if stat.S_ISDIR(metadata.st_mode):
+                    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                    try:
+                        child_fd = os.open(name, flags, dir_fd=directory_fd)
+                    except FileNotFoundError:
+                        continue
+                    except OSError as exc:
+                        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                            raise PermissionError("Workspace path is unsafe") from exc
+                        raise
+                    try:
+                        walk(child_fd, (*prefix, name), depth + 1)
+                    finally:
+                        os.close(child_fd)
+                    continue
+                if stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1:
+                    try:
+                        _parse_workspace_relative_path(relative)
+                    except ValueError as exc:
+                        raise PermissionError("Workspace path is unsafe") from exc
+                    rows.append({"path": relative, "sizeBytes": metadata.st_size})
+                    if len(rows) > _WORKSPACE_FILE_LIST_LIMIT:
+                        raise OverflowError("Workspace contains too many files")
+
+    try:
+        walk(root_fd, (), 0)
+    finally:
+        os.close(root_fd)
+    return sorted(rows, key=lambda row: row["path"])
+
+
+def _parse_workspace_relative_path(raw: str) -> tuple[str, ...]:
+    if not raw or len(raw) > _WORKSPACE_RELATIVE_PATH_LIMIT:
+        raise ValueError("Workspace file path is invalid")
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in raw):
+        raise ValueError("Workspace file path is invalid")
+    parsed = PurePosixPath(raw)
+    if parsed.is_absolute() or ".." in parsed.parts or raw != str(parsed):
+        raise ValueError("Workspace file path is invalid")
+    if not parsed.parts:
+        raise ValueError("Workspace file path is invalid")
+    return parsed.parts
+
+
+def _read_managed_workspace_file(root_path: Path, relative_path: str) -> bytes:
+    """Read one regular file through descriptor-anchored traversal."""
+    parts = _parse_workspace_relative_path(relative_path)
+    current_fd = _open_managed_session_root_fd(root_path)
+    file_fd: Optional[int] = None
+    try:
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        for part in parts[:-1]:
+            next_fd = os.open(part, directory_flags, dir_fd=current_fd)
+            os.close(current_fd)
+            current_fd = next_fd
+        file_fd = os.open(
+            parts[-1],
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=current_fd,
+        )
+        metadata = os.fstat(file_fd)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise PermissionError("Workspace file is unsafe")
+        if metadata.st_size > _WORKSPACE_FILE_READ_LIMIT_BYTES:
+            raise OverflowError("Workspace file is too large")
+        chunks: List[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(file_fd, 1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > _WORKSPACE_FILE_READ_LIMIT_BYTES:
+                raise OverflowError("Workspace file is too large")
+            chunks.append(chunk)
+        return b"".join(chunks)
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise PermissionError("Workspace path is unsafe") from exc
+        raise
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+        os.close(current_fd)
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -936,8 +1076,10 @@ def _session_root_file_ops_supported() -> bool:
     return (
         os.name == "posix"
         and bool(getattr(os, "O_NOFOLLOW", 0))
+        and bool(getattr(os, "O_NONBLOCK", 0))
         and all(operation in os.supports_dir_fd for operation in required_dir_fd)
         and os.listdir in os.supports_fd
+        and os.scandir in os.supports_fd
     )
 
 
@@ -1591,6 +1733,8 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/models", self._handle_models),
             ("GET", "/v1/capabilities", self._handle_capabilities),
             ("POST", "/v1/session-root-canary", self._handle_session_root_canary),
+            ("GET", "/v1/workspace/files", self._handle_workspace_files),
+            ("GET", "/v1/workspace/file", self._handle_workspace_file),
             ("GET", "/v1/skills", self._handle_skills),
             ("GET", "/v1/toolsets", self._handle_toolsets),
             ("GET", "/api/sessions", self._handle_list_sessions),
@@ -2362,6 +2506,8 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
+        workspace_files_supported = _session_root_file_ops_supported()
+
         return web.json_response({
             "object": "hermes.api_server.capabilities",
             "platform": "hermes-agent",
@@ -2406,7 +2552,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_key_header": "X-Hermes-Session-Key",
                 "session_root_header": (
                     "X-Hermes-Session-Root"
-                    if _session_root_file_ops_supported()
+                    if workspace_files_supported
                     else False
                 ),
                 "cors": bool(self._cors_origins),
@@ -2424,6 +2570,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
                 "skills": {"method": "GET", "path": "/v1/skills"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
+                **(
+                    {
+                        "workspace_files": {"method": "GET", "path": "/v1/workspace/files"},
+                        "workspace_file": {"method": "GET", "path": "/v1/workspace/file"},
+                    }
+                    if workspace_files_supported
+                    else {}
+                ),
                 "sessions": {"method": "GET", "path": "/api/sessions"},
                 "session_create": {"method": "POST", "path": "/api/sessions"},
                 "session": {"method": "GET", "path": "/api/sessions/{session_id}"},
@@ -2435,6 +2589,90 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
             },
         })
+
+    async def _handle_workspace_files(self, request: "web.Request") -> "web.Response":
+        """GET /v1/workspace/files — list safe files below the authenticated root."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        root, root_err = self._parse_session_root_header(request)
+        if root_err:
+            return root_err
+        if root is None:
+            return web.json_response(
+                _openai_error("X-Hermes-Session-Root is required"),
+                status=400,
+            )
+        try:
+            data = await asyncio.to_thread(_list_managed_workspace_files, Path(root))
+        except PermissionError:
+            return web.json_response(
+                _openai_error("Workspace contains an unsafe path"),
+                status=403,
+            )
+        except OverflowError:
+            return web.json_response(
+                _openai_error("Workspace contains too many entries"),
+                status=413,
+            )
+        except OSError:
+            logger.exception("GET /v1/workspace/files failed")
+            return web.json_response(
+                _openai_error("Failed to enumerate workspace files", err_type="server_error"),
+                status=500,
+            )
+        return web.json_response({"data": data})
+
+    async def _handle_workspace_file(self, request: "web.Request") -> "web.Response":
+        """GET /v1/workspace/file — read one safe file below the authenticated root."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        root, root_err = self._parse_session_root_header(request)
+        if root_err:
+            return root_err
+        if root is None:
+            return web.json_response(
+                _openai_error("X-Hermes-Session-Root is required"),
+                status=400,
+            )
+        try:
+            body = await asyncio.to_thread(
+                _read_managed_workspace_file,
+                Path(root),
+                request.query.get("path", ""),
+            )
+        except ValueError:
+            return web.json_response(
+                _openai_error("Invalid workspace file path"),
+                status=400,
+            )
+        except FileNotFoundError:
+            return web.json_response(
+                _openai_error("Workspace file was not found"),
+                status=404,
+            )
+        except PermissionError:
+            return web.json_response(
+                _openai_error("Workspace file path is unsafe"),
+                status=403,
+            )
+        except OverflowError:
+            return web.json_response(
+                _openai_error("Workspace file is too large"),
+                status=413,
+            )
+        except OSError:
+            logger.exception("GET /v1/workspace/file failed")
+            return web.json_response(
+                _openai_error("Failed to read workspace file", err_type="server_error"),
+                status=500,
+            )
+        return web.Response(
+            body=body,
+            content_type="application/octet-stream",
+            headers={"X-Content-Type-Options": "nosniff"},
+        )
 
     async def _handle_skills(self, request: "web.Request") -> "web.Response":
         """GET /v1/skills — list installed skills visible to the API-server agent.
