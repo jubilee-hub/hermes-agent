@@ -7,6 +7,8 @@ network, quota, and host paths remain fixed by the Runner.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import http.client
 import json
 import os
@@ -27,6 +29,10 @@ _MAX_COMMAND_CHARS = 65_536
 _MAX_STDIN_CHARS = 1_048_576
 _MAX_OUTPUT_BYTES = 1_048_576
 _MAX_RESPONSE_BYTES = 2 * 1_048_576 + 4096
+_MAX_ARTIFACT_BYTES = 16 * 1_048_576
+_MAX_ARTIFACT_RESPONSE_BYTES = ((_MAX_ARTIFACT_BYTES + 2) // 3) * 4 + 65_536
+_ARTIFACT_REQUEST_TIMEOUT_SECONDS = 35.0
+_MAX_ARTIFACT_FILENAME_BYTES = 240
 _MIN_TOKEN_BYTES = 32
 _MAX_TOKEN_BYTES = 512
 
@@ -111,6 +117,7 @@ class SandboxRunnerEnvironment(BaseEnvironment):
         super().__init__(cwd="/workspace" if not cwd else cwd, timeout=timeout)
         self._task_key = self._validate_task_key(task_key)
         self._socket_path = self._validate_socket_path(socket_path)
+        self._token_owner_must_differ = token_owner_must_differ
         self._token_fd = self._validate_token_fd(
             token_fd,
             owner_must_differ=token_owner_must_differ,
@@ -183,6 +190,10 @@ class SandboxRunnerEnvironment(BaseEnvironment):
         if (
             not stat.S_ISREG(metadata.st_mode)
             or stat.S_IMODE(metadata.st_mode) != 0o600
+            or (
+                self._token_owner_must_differ
+                and metadata.st_uid == _effective_uid()
+            )
         ):
             raise RuntimeError("Sandbox runner credential is unavailable.")
         if raw.endswith(b"\n"):
@@ -307,9 +318,14 @@ class SandboxRunnerEnvironment(BaseEnvironment):
             raise RuntimeError("Sandbox runner execution failed closed.") from exc
 
     @staticmethod
-    def _read_bounded_response(response: http.client.HTTPResponse) -> bytes:
+    def _read_bounded_response(
+        response: http.client.HTTPResponse,
+        *,
+        max_response_bytes: int = _MAX_RESPONSE_BYTES,
+    ) -> bytes:
         content_type = response.getheader("content-type", "")
-        if not content_type.lower().startswith("application/json"):
+        media_type = content_type.partition(";")[0].strip().lower()
+        if media_type != "application/json":
             raise RuntimeError("Sandbox runner response is invalid.")
         content_length = response.getheader("content-length")
         if content_length is not None:
@@ -317,10 +333,10 @@ class SandboxRunnerEnvironment(BaseEnvironment):
                 declared_length = int(content_length)
             except ValueError as exc:
                 raise RuntimeError("Sandbox runner response is invalid.") from exc
-            if declared_length < 0 or declared_length > _MAX_RESPONSE_BYTES:
+            if declared_length < 0 or declared_length > max_response_bytes:
                 raise RuntimeError("Sandbox runner response is invalid.")
-        body = response.read(_MAX_RESPONSE_BYTES + 1)
-        if len(body) > _MAX_RESPONSE_BYTES:
+        body = response.read(max_response_bytes + 1)
+        if len(body) > max_response_bytes:
             raise RuntimeError("Sandbox runner response is invalid.")
         return body
 
@@ -373,6 +389,157 @@ class SandboxRunnerEnvironment(BaseEnvironment):
             output = f"{stdout}\n{stderr}" if stdout else stderr
         return output, 124 if timed_out else int(exit_code)
 
+    def read_artifact(self, filename: str) -> dict[str, Any]:
+        """Read one fixed-outbox artifact through the authenticated Runner."""
+        filename = self._validate_artifact_filename(filename)
+        call = _CancelableRunnerCall()
+        with self._calls_lock:
+            if self._closed:
+                raise RuntimeError("Sandbox runner environment is closed.")
+            self._calls.add(call)
+        try:
+            return self._read_artifact_remote(call, filename)
+        finally:
+            with self._calls_lock:
+                self._calls.discard(call)
+
+    def _read_artifact_remote(
+        self,
+        call: _CancelableRunnerCall,
+        filename: str,
+    ) -> dict[str, Any]:
+        try:
+            self._assert_socket_ready()
+            payload = {
+                "schemaVersion": 1,
+                "taskKey": self._task_key,
+                "filename": filename,
+            }
+            body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            token = self._read_token()
+            connection = _UnixHTTPConnection(
+                self._socket_path,
+                timeout=_ARTIFACT_REQUEST_TIMEOUT_SECONDS,
+            )
+            call.bind(connection)
+            try:
+                connection.request(
+                    "POST",
+                    "/v1/artifacts/read",
+                    body=body,
+                    headers={
+                        "authorization": f"Bearer {token}",
+                        "content-type": "application/json",
+                        "content-length": str(len(body)),
+                    },
+                )
+                response = connection.getresponse()
+                response_body = self._read_bounded_response(
+                    response,
+                    max_response_bytes=_MAX_ARTIFACT_RESPONSE_BYTES,
+                )
+            finally:
+                call.release(connection)
+                connection.close()
+
+            if response.status != 200:
+                raise RuntimeError("Sandbox runner request was rejected.")
+            return self._parse_artifact_response(
+                response_body,
+                expected_filename=filename,
+                expected_task_ref=self._task_ref(),
+            )
+        except Exception as exc:
+            if isinstance(exc, RuntimeError) and str(exc).startswith("Sandbox runner "):
+                raise
+            raise RuntimeError("Sandbox runner artifact export failed closed.") from exc
+
+    @staticmethod
+    def _validate_artifact_filename(filename: str) -> str:
+        if not isinstance(filename, str):
+            raise RuntimeError("Sandbox runner artifact filename is invalid.")
+        try:
+            encoded_filename = filename.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise RuntimeError("Sandbox runner artifact filename is invalid.") from exc
+        if (
+            not filename
+            or filename in {".", ".."}
+            or "/" in filename
+            or "\\" in filename
+            or any(
+                ord(character) < 32 or 127 <= ord(character) <= 159
+                for character in filename
+            )
+            or len(encoded_filename) > _MAX_ARTIFACT_FILENAME_BYTES
+        ):
+            raise RuntimeError("Sandbox runner artifact filename is invalid.")
+        return filename
+
+    def _task_ref(self) -> str:
+        digest = hashlib.sha256(
+            b"agent-saas-sandbox-runner-v1\0" + self._task_key.encode("utf-8")
+        ).hexdigest()
+        return f"sbx-{digest}"
+
+    @staticmethod
+    def _parse_artifact_response(
+        body: bytes,
+        *,
+        expected_filename: str,
+        expected_task_ref: str,
+    ) -> dict[str, Any]:
+        try:
+            value = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("Sandbox runner response is invalid.") from exc
+        allowed = {
+            "schemaVersion",
+            "ok",
+            "taskRef",
+            "filename",
+            "sizeBytes",
+            "checksumSha256",
+            "contentBase64",
+        }
+        if not isinstance(value, dict) or set(value) != allowed:
+            raise RuntimeError("Sandbox runner response is invalid.")
+
+        size_bytes = value.get("sizeBytes")
+        content_base64 = value.get("contentBase64")
+        checksum = value.get("checksumSha256")
+        if (
+            value.get("schemaVersion") != 1
+            or value.get("ok") is not True
+            or value.get("taskRef") != expected_task_ref
+            or value.get("filename") != expected_filename
+            or isinstance(size_bytes, bool)
+            or not isinstance(size_bytes, int)
+            or size_bytes < 1
+            or size_bytes > _MAX_ARTIFACT_BYTES
+            or not isinstance(checksum, str)
+            or not re.fullmatch(r"[a-f0-9]{64}", checksum)
+            or not isinstance(content_base64, str)
+        ):
+            raise RuntimeError("Sandbox runner response is invalid.")
+
+        try:
+            content = base64.b64decode(content_base64, validate=True)
+        except Exception as exc:
+            raise RuntimeError("Sandbox runner response is invalid.") from exc
+        if (
+            len(content) != size_bytes
+            or base64.b64encode(content).decode("ascii") != content_base64
+            or hashlib.sha256(content).hexdigest() != checksum
+        ):
+            raise RuntimeError("Sandbox runner response is invalid.")
+        return {
+            "filename": expected_filename,
+            "sizeBytes": size_bytes,
+            "checksumSha256": checksum,
+            "contentBase64": content_base64,
+        }
+
     def cleanup(self):
         """Release local transports only; durable overlay deletion is #625."""
         with self._calls_lock:
@@ -383,6 +550,45 @@ class SandboxRunnerEnvironment(BaseEnvironment):
             self._task_key = ""
         for call in calls:
             call.cancel()
+
+
+def read_sandbox_runner_artifact(
+    task_id: str,
+    filename: str,
+) -> dict[str, Any]:
+    """Export one artifact using only the current request-scoped task lease."""
+    from tools.terminal_tool import resolve_exact_task_overrides
+
+    if not isinstance(task_id, str) or not task_id:
+        raise RuntimeError("Sandbox runner task identity is unavailable.")
+    overrides = resolve_exact_task_overrides(task_id)
+    task_key = overrides.get("sandbox_task_key")
+    if overrides.get("env_type") != "sandbox_runner" or not isinstance(task_key, str):
+        raise RuntimeError("Sandbox runner task identity is unavailable.")
+
+    raw_token_fd = os.getenv(
+        "HERMES_SANDBOX_RUNNER_TOKEN_FD",
+        str(DEFAULT_TOKEN_FD),
+    )
+    try:
+        token_fd = int(raw_token_fd)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Sandbox runner credential is unavailable.") from exc
+    socket_path = os.getenv(
+        "HERMES_SANDBOX_RUNNER_SOCKET_PATH",
+        DEFAULT_SOCKET_PATH,
+    )
+    environment = SandboxRunnerEnvironment(
+        task_key=task_key,
+        socket_path=socket_path,
+        token_fd=token_fd,
+        cwd="/workspace",
+        initialize_session=False,
+    )
+    try:
+        return environment.read_artifact(filename)
+    finally:
+        environment.cleanup()
 
 
 def sandbox_runner_ready_from_environment() -> bool:
@@ -410,6 +616,7 @@ def sandbox_runner_ready_from_environment() -> bool:
             token_fd,
             owner_must_differ=True,
         )
+        probe._token_owner_must_differ = True
         probe._assert_socket_ready()
         token = probe._read_token()
 
@@ -430,6 +637,12 @@ def sandbox_runner_ready_from_environment() -> bool:
             and capabilities.get("schemaVersion") == 1
             and capabilities.get("isolation") == "per_task_overlay"
             and capabilities.get("network") == "disabled"
+            and capabilities.get("artifactExport")
+            == {
+                "outbox": "/workspace/artifacts",
+                "pathPolicy": "plain_filename_no_follow",
+                "maxBytes": _MAX_ARTIFACT_BYTES,
+            }
             and isinstance(capabilities.get("limits"), dict)
         )
     except Exception:
