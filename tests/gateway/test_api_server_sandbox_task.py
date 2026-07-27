@@ -44,6 +44,8 @@ def _adapter(tmp_path, *, required=True):
 
 def _app(adapter):
     app = web.Application()
+    app.router.add_get("/health", adapter._handle_health)
+    app.router.add_get("/health/detailed", adapter._handle_health_detailed)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_post("/v1/runs", adapter._handle_runs)
@@ -532,8 +534,12 @@ async def test_capabilities_advertise_controlled_sandbox_contract(tmp_path):
     app = _app(adapter)
 
     async with TestClient(TestServer(app)) as client:
-        response = await client.get("/v1/capabilities", headers=AUTH)
-        body = await response.json()
+        with patch(
+            "tools.environments.sandbox_runner.sandbox_runner_ready_from_environment",
+            return_value=True,
+        ):
+            response = await client.get("/v1/capabilities", headers=AUTH)
+            body = await response.json()
 
     assert response.status == 200
     assert body["runtime"] == {
@@ -551,6 +557,55 @@ async def test_capabilities_advertise_controlled_sandbox_contract(tmp_path):
     assert body["features"]["sandbox_task_key_required"] is True
     assert body["features"]["run_submission"] is False
     assert body["features"]["session_chat"] is False
+
+
+@pytest.mark.asyncio
+async def test_health_and_capabilities_fail_closed_when_runner_is_not_ready(tmp_path):
+    adapter = _adapter(tmp_path)
+
+    async with TestClient(TestServer(_app(adapter))) as client:
+        with patch(
+            "tools.environments.sandbox_runner.sandbox_runner_ready_from_environment",
+            return_value=False,
+        ):
+            health = await client.get("/health")
+            health_body = await health.json()
+            capabilities = await client.get("/v1/capabilities", headers=AUTH)
+            capabilities_body = await capabilities.json()
+
+    assert health.status == 503
+    assert health_body["status"] == "not_ready"
+    assert capabilities.status == 503
+    assert capabilities_body["error"]["code"] == "sandbox_runner_not_ready"
+
+
+@pytest.mark.asyncio
+async def test_detailed_health_reports_runner_degraded_without_transport_details(tmp_path):
+    adapter = _adapter(tmp_path)
+
+    async with TestClient(TestServer(_app(adapter))) as client:
+        with (
+            patch(
+                "tools.environments.sandbox_runner.sandbox_runner_ready_from_environment",
+                return_value=False,
+            ),
+            patch(
+                "gateway.status.read_runtime_status",
+                return_value={"gateway_state": "running"},
+            ),
+            patch(
+                "gateway.run._resolve_gateway_model",
+                return_value="test/model",
+            ),
+        ):
+            response = await client.get("/health/detailed", headers=AUTH)
+            body = await response.json()
+
+    assert response.status == 200
+    assert body["status"] == "degraded"
+    assert body["readiness"]["checks"]["sandbox_runner"] == {"status": "degraded"}
+    assert "socket" not in json.dumps(body).lower()
+    assert "token" not in json.dumps(body).lower()
 
 
 def test_session_db_binds_only_a_hash_and_rejects_conflicting_context(tmp_path):

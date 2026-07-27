@@ -2347,8 +2347,26 @@ class APIServerAdapter(BasePlatformAdapter):
     # HTTP Handlers
     # ------------------------------------------------------------------
 
+    async def _sandbox_runner_ready(self) -> bool:
+        if not self._sandbox_task_key_required:
+            return True
+        from tools.environments.sandbox_runner import (
+            sandbox_runner_ready_from_environment,
+        )
+
+        return await asyncio.to_thread(sandbox_runner_ready_from_environment)
+
     async def _handle_health(self, request: "web.Request") -> "web.Response":
         """GET /health — simple health check."""
+        if not await self._sandbox_runner_ready():
+            return web.json_response(
+                {
+                    "status": "not_ready",
+                    "platform": "hermes-agent",
+                    "version": _hermes_version(),
+                },
+                status=503,
+            )
         return web.json_response(
             {"status": "ok", "platform": "hermes-agent", "version": _hermes_version()}
         )
@@ -2387,6 +2405,20 @@ class APIServerAdapter(BasePlatformAdapter):
             process_completion_queue_depth=process_depth,
             active_delegations=active_delegations,
         )
+        if self._sandbox_task_key_required:
+            checks = dict(readiness.get("checks", {}))
+            checks["sandbox_runner"] = {
+                "status": "ok" if await self._sandbox_runner_ready() else "degraded"
+            }
+            readiness = {
+                **readiness,
+                "status": (
+                    "ok"
+                    if all(item.get("status") == "ok" for item in checks.values())
+                    else "degraded"
+                ),
+                "checks": checks,
+            }
         return web.json_response({
             "status": readiness["status"],
             "readiness": readiness,
@@ -2650,6 +2682,14 @@ class APIServerAdapter(BasePlatformAdapter):
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
+        if not await self._sandbox_runner_ready():
+            return web.json_response(
+                _openai_error(
+                    "Sandbox execution runtime is not ready.",
+                    code="sandbox_runner_not_ready",
+                ),
+                status=503,
+            )
 
         workspace_files_supported = _session_root_file_ops_supported()
 
