@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
 import socket
@@ -10,13 +12,17 @@ from pathlib import Path
 
 import pytest
 
+import tools.environments.sandbox_runner as sandbox_runner
 from tools.environments.sandbox_runner import (
     SandboxRunnerEnvironment,
+    read_sandbox_runner_artifact,
     sandbox_runner_ready_from_environment,
 )
+from tools.terminal_tool import scoped_task_env_overrides
 
 
 TASK_KEY = "sandbox-v1-" + ("a" * 43)
+TASK_KEY_B = "sandbox-v1-" + ("b" * 43)
 TOKEN = "runner-test-token-with-at-least-thirty-two-bytes"
 
 
@@ -36,10 +42,23 @@ class _ThreadedUnixHTTPServer(
             "timedOut": False,
         }
         self.status = 200
+        self.response_content_type = "application/json"
         self.request_started = threading.Event()
         self.release_response = threading.Event()
         self.disconnect_observed = threading.Event()
         self.block_response = False
+        self.capabilities: dict[str, object] = {
+            "schemaVersion": 1,
+            "isolation": "per_task_overlay",
+            "network": "disabled",
+            "imageFingerprint": "sha256:" + ("a" * 64),
+            "artifactExport": {
+                "outbox": "/workspace/artifacts",
+                "pathPolicy": "plain_filename_no_follow",
+                "maxBytes": 16 * 1_048_576,
+            },
+            "limits": {"maxTimeoutMs": 300_000},
+        }
         super().__init__(socket_path, _RunnerHandler)
 
 
@@ -61,7 +80,7 @@ class _RunnerHandler(BaseHTTPRequestHandler):
         payload = json.dumps(self.server.response).encode()
         try:
             self.send_response(self.server.status)
-            self.send_header("content-type", "application/json")
+            self.send_header("content-type", self.server.response_content_type)
             self.send_header("content-length", str(len(payload)))
             self.end_headers()
             self.wfile.write(payload)
@@ -80,13 +99,7 @@ class _RunnerHandler(BaseHTTPRequestHandler):
             self.path == "/v1/capabilities"
             and self.headers.get("authorization") == f"Bearer {TOKEN}"
         ):
-            payload = {
-                "schemaVersion": 1,
-                "isolation": "per_task_overlay",
-                "network": "disabled",
-                "imageFingerprint": "sha256:" + ("a" * 64),
-                "limits": {"maxTimeoutMs": 300_000},
-            }
+            payload = self.server.capabilities
             status_code = 200
         else:
             payload = {"schemaVersion": 1, "error": {"code": "unauthorized"}}
@@ -135,6 +148,30 @@ def _environment(socket_path: Path, token_fd: int) -> SandboxRunnerEnvironment:
     )
 
 
+def _task_ref(task_key: str) -> str:
+    digest = hashlib.sha256(
+        b"agent-saas-sandbox-runner-v1\0" + task_key.encode("utf-8")
+    ).hexdigest()
+    return f"sbx-{digest}"
+
+
+def _artifact_response(
+    task_key: str,
+    *,
+    filename: str = "report.bin",
+    content: bytes = b"artifact-bytes",
+) -> dict[str, object]:
+    return {
+        "schemaVersion": 1,
+        "ok": True,
+        "taskRef": _task_ref(task_key),
+        "filename": filename,
+        "sizeBytes": len(content),
+        "checksumSha256": hashlib.sha256(content).hexdigest(),
+        "contentBase64": base64.b64encode(content).decode("ascii"),
+    }
+
+
 def test_exec_uses_authenticated_uds_and_maps_bounded_result(runner_fixture):
     server, socket_path, token_fd = runner_fixture
     server.response = {
@@ -168,6 +205,245 @@ def test_exec_uses_authenticated_uds_and_maps_bounded_result(runner_fixture):
     assert body["timeoutMs"] == 2000
     assert "printf user-command" in str(body["command"])
     assert "builtin cd -- /workspace/project" in str(body["command"])
+
+
+def test_artifact_export_uses_authenticated_uds_and_validates_the_task_bound_result(
+    runner_fixture,
+):
+    server, socket_path, token_fd = runner_fixture
+    server.response = _artifact_response(TASK_KEY)
+    environment = _environment(socket_path, token_fd)
+
+    result = environment.read_artifact("report.bin")
+
+    assert result == {
+        "filename": "report.bin",
+        "sizeBytes": len(b"artifact-bytes"),
+        "checksumSha256": hashlib.sha256(b"artifact-bytes").hexdigest(),
+        "contentBase64": base64.b64encode(b"artifact-bytes").decode("ascii"),
+    }
+    assert server.requests == [
+        {
+            "path": "/v1/artifacts/read",
+            "authorization": f"Bearer {TOKEN}",
+            "contentType": "application/json",
+            "body": {
+                "schemaVersion": 1,
+                "taskKey": TASK_KEY,
+                "filename": "report.bin",
+            },
+        }
+    ]
+
+
+def test_request_scoped_artifact_helper_never_reuses_another_task_capability(
+    runner_fixture,
+    monkeypatch,
+):
+    server, socket_path, token_fd = runner_fixture
+    monkeypatch.setenv("HERMES_SANDBOX_RUNNER_SOCKET_PATH", str(socket_path))
+    monkeypatch.setenv("HERMES_SANDBOX_RUNNER_TOKEN_FD", str(token_fd))
+    monkeypatch.setattr(
+        sandbox_runner,
+        "_effective_uid",
+        lambda: os.fstat(token_fd).st_uid + 1,
+    )
+
+    for task_id, task_key, content in (
+        ("sandbox-task-" + ("a" * 64), TASK_KEY, b"A-ONLY"),
+        ("sandbox-task-" + ("b" * 64), TASK_KEY_B, b"B-ONLY"),
+    ):
+        server.response = _artifact_response(task_key, content=content)
+        with scoped_task_env_overrides(
+            task_id,
+            {"env_type": "sandbox_runner", "sandbox_task_key": task_key},
+        ):
+            result = read_sandbox_runner_artifact(task_id, "report.bin")
+        assert base64.b64decode(result["contentBase64"], validate=True) == content
+        assert server.requests[-1]["body"]["taskKey"] == task_key
+
+        with pytest.raises(
+            RuntimeError,
+            match="Sandbox runner task identity is unavailable",
+        ):
+            read_sandbox_runner_artifact(task_id, "report.bin")
+
+    with scoped_task_env_overrides(
+        "default",
+        {"env_type": "sandbox_runner", "sandbox_task_key": TASK_KEY_B},
+    ):
+        with pytest.raises(
+            RuntimeError,
+            match="Sandbox runner task identity is unavailable",
+        ):
+            read_sandbox_runner_artifact(
+                "sandbox-task-" + ("c" * 64),
+                "report.bin",
+            )
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda response: {**response, "extra": "field"},
+        lambda response: {**response, "taskRef": _task_ref(TASK_KEY_B)},
+        lambda response: {**response, "filename": "other.bin"},
+        lambda response: {**response, "sizeBytes": True},
+        lambda response: {**response, "sizeBytes": response["sizeBytes"] + 1},
+        lambda response: {**response, "sizeBytes": 16 * 1_048_576 + 1},
+        lambda response: {**response, "checksumSha256": "0" * 64},
+        lambda response: {**response, "contentBase64": "YQ"},
+    ],
+)
+def test_artifact_export_rejects_malformed_or_mismatched_runner_responses(
+    runner_fixture,
+    mutate,
+    caplog,
+):
+    server, socket_path, token_fd = runner_fixture
+    server.response = mutate(_artifact_response(TASK_KEY))
+    environment = _environment(socket_path, token_fd)
+
+    with pytest.raises(RuntimeError, match="Sandbox runner response is invalid"):
+        environment.read_artifact("report.bin")
+
+    assert TOKEN not in caplog.text
+    assert TASK_KEY not in caplog.text
+
+
+def test_artifact_export_rejects_json_lookalike_content_type(runner_fixture):
+    server, socket_path, token_fd = runner_fixture
+    server.response = _artifact_response(TASK_KEY)
+    server.response_content_type = "application/jsonp"
+    environment = _environment(socket_path, token_fd)
+
+    with pytest.raises(RuntimeError, match="Sandbox runner response is invalid"):
+        environment.read_artifact("report.bin")
+
+
+@pytest.mark.parametrize("status", [401, 404, 413, 503])
+def test_artifact_export_collapses_runner_statuses_without_secret_leakage(
+    runner_fixture,
+    status,
+    caplog,
+):
+    server, socket_path, token_fd = runner_fixture
+    server.status = status
+    server.response = {
+        "schemaVersion": 1,
+        "error": {"code": "untrusted-runner-detail"},
+    }
+    environment = _environment(socket_path, token_fd)
+
+    with pytest.raises(RuntimeError, match="Sandbox runner request was rejected"):
+        environment.read_artifact("report.bin")
+
+    assert "untrusted-runner-detail" not in caplog.text
+    assert TOKEN not in caplog.text
+    assert TASK_KEY not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "",
+        ".",
+        "..",
+        "../report.bin",
+        "nested/report.bin",
+        "line\nbreak.bin",
+        "\ud800",
+    ],
+)
+def test_artifact_export_rejects_non_plain_filenames_before_transport(
+    runner_fixture,
+    filename,
+):
+    server, socket_path, token_fd = runner_fixture
+    environment = _environment(socket_path, token_fd)
+
+    with pytest.raises(RuntimeError, match="artifact filename is invalid"):
+        environment.read_artifact(filename)
+
+    assert server.requests == []
+
+
+def test_artifact_export_rechecks_socket_and_token_metadata(runner_fixture):
+    server, socket_path, token_fd = runner_fixture
+    server.response = _artifact_response(TASK_KEY)
+    environment = _environment(socket_path, token_fd)
+
+    socket_path.chmod(0o666)
+    with pytest.raises(RuntimeError, match="transport is unavailable"):
+        environment.read_artifact("report.bin")
+    assert server.requests == []
+
+    socket_path.chmod(0o660)
+    os.fchmod(token_fd, 0o644)
+    with pytest.raises(RuntimeError, match="credential is unavailable"):
+        environment.read_artifact("report.bin")
+    assert server.requests == []
+
+
+def test_artifact_export_rechecks_the_fd_owner_contract(
+    runner_fixture,
+    monkeypatch,
+):
+    server, socket_path, token_fd = runner_fixture
+    server.response = _artifact_response(TASK_KEY)
+    token_owner = os.fstat(token_fd).st_uid
+    monkeypatch.setattr(sandbox_runner, "_effective_uid", lambda: token_owner + 1)
+    environment = SandboxRunnerEnvironment(
+        task_key=TASK_KEY,
+        socket_path=str(socket_path),
+        token_fd=token_fd,
+        initialize_session=False,
+    )
+
+    monkeypatch.setattr(sandbox_runner, "_effective_uid", lambda: token_owner)
+    with pytest.raises(RuntimeError, match="credential is unavailable"):
+        environment.read_artifact("report.bin")
+    assert server.requests == []
+
+
+def test_artifact_export_timeout_closes_the_uds_request(
+    runner_fixture,
+    monkeypatch,
+):
+    server, socket_path, token_fd = runner_fixture
+    server.block_response = True
+    environment = _environment(socket_path, token_fd)
+    monkeypatch.setattr(
+        sandbox_runner,
+        "_ARTIFACT_REQUEST_TIMEOUT_SECONDS",
+        0.1,
+    )
+
+    with pytest.raises(RuntimeError, match="artifact export failed closed"):
+        environment.read_artifact("report.bin")
+
+    server.release_response.set()
+    assert server.disconnect_observed.wait(timeout=2)
+
+
+def test_live_readiness_requires_the_exact_artifact_export_policy(
+    runner_fixture,
+    monkeypatch,
+):
+    server, socket_path, token_fd = runner_fixture
+    monkeypatch.setenv("HERMES_SANDBOX_RUNNER_SOCKET_PATH", str(socket_path))
+    monkeypatch.setenv("HERMES_SANDBOX_RUNNER_TOKEN_FD", str(token_fd))
+    monkeypatch.setattr(
+        sandbox_runner,
+        "_effective_uid",
+        lambda: os.fstat(token_fd).st_uid + 1,
+    )
+
+    assert sandbox_runner_ready_from_environment() is True
+    artifact_export = server.capabilities["artifactExport"]
+    assert isinstance(artifact_export, dict)
+    artifact_export["pathPolicy"] = "unsafe_follow"
+    assert sandbox_runner_ready_from_environment() is False
 
 
 def test_timeout_result_maps_to_shell_timeout_without_fallback(runner_fixture):
@@ -356,22 +632,14 @@ def test_live_readiness_requires_uds_policy_and_bearer_auth(
     monkeypatch.setenv("HERMES_SANDBOX_RUNNER_SOCKET_PATH", str(socket_path))
     monkeypatch.setenv("HERMES_SANDBOX_RUNNER_TOKEN_FD", str(token_fd))
 
-    # Unit tests own their fixture token. The production contract additionally
-    # requires the inherited source owner to differ from uid 10000, which is
-    # covered by the constructor test and T1 readback.
-    with pytest.MonkeyPatch.context() as probe_patch:
-        original = SandboxRunnerEnvironment._validate_token_fd
-        probe_patch.setattr(
-            SandboxRunnerEnvironment,
-            "_validate_token_fd",
-            staticmethod(
-                lambda fd, *, owner_must_differ: original(
-                    fd,
-                    owner_must_differ=False,
-                )
-            ),
-        )
-        assert sandbox_runner_ready_from_environment() is True
+    # Unit tests own their fixture token. Simulate the production split owner;
+    # both constructor and every positional token read re-check this contract.
+    monkeypatch.setattr(
+        sandbox_runner,
+        "_effective_uid",
+        lambda: os.fstat(token_fd).st_uid + 1,
+    )
+    assert sandbox_runner_ready_from_environment() is True
 
     os.fchmod(token_fd, 0o644)
     assert sandbox_runner_ready_from_environment() is False

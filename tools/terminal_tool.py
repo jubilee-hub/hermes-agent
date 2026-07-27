@@ -1273,6 +1273,20 @@ def resolve_task_overrides(task_id: Optional[str]) -> Dict[str, Any]:
         )
 
 
+def resolve_exact_task_overrides(task_id: Optional[str]) -> Dict[str, Any]:
+    """Return only the override leased under the exact raw task identifier.
+
+    Security-sensitive request capabilities must use this lookup instead of
+    :func:`resolve_task_overrides`, whose ``"default"`` fallback is intentional
+    for non-secret workspace configuration but must never select another
+    request's capability.
+    """
+    if not isinstance(task_id, str) or not task_id:
+        return {}
+    with _task_env_overrides_lock:
+        return dict(_task_env_overrides.get(task_id) or {})
+
+
 def resolve_task_env_type(task_id: Optional[str], default: str) -> str:
     """Resolve the execution backend without silently dropping an override."""
     override = resolve_task_overrides(task_id).get("env_type")
