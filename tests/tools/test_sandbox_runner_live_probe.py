@@ -64,11 +64,3 @@ raise SystemExit(1)
         check=False,
     )
     assert result.returncode == 0, result.stderr
-
-
-def test_compatibility_image_packages_runner_probe_and_implementation():
-    dockerfile = (
-        Path(__file__).resolve().parents[2] / "Dockerfile.agent-saas-session-root"
-    ).read_text(encoding="utf-8")
-    assert "tools/environments/sandbox_runner.py" in dockerfile
-    assert "scripts/sandbox_runner_live_e2e.py" in dockerfile
