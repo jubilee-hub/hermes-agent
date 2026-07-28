@@ -1,4 +1,4 @@
-"""CI-discovered image contract for the Agent SaaS compatibility overlay."""
+"""CI-discovered contract for the pinned Agent SaaS production image."""
 
 from __future__ import annotations
 
@@ -12,20 +12,17 @@ import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _PATCH_REVISION = "compatibility-image-contract-test"
+_OFFICIAL_BASE_DIGEST = (
+    "sha256:f7b35053268f532f98955195c909f15a230470fbcbdacaa9fdecb95707dad04a"
+)
 _OPTIMIZED_PROBE = """
-import sys
-import types
-from pathlib import Path
-
-base = types.ModuleType("tools.environments.base")
-base.BaseEnvironment = type("BaseEnvironment", (), {"__init__": lambda self, *args, **kwargs: None})
-base._ThreadedProcessHandle = type("_ThreadedProcessHandle", (), {})
-sys.modules["tools.environments.base"] = base
-
-handler = Path("/opt/hermes/gateway/platforms/api_server.py")
-compile(handler.read_text(encoding="utf-8"), str(handler), "exec")
+import os
+import gateway.platforms.api_server
 import tools.environments.sandbox_runner
 from scripts import sandbox_runner_live_e2e as probe
+
+if os.geteuid() != 10000:
+    raise RuntimeError("compatibility image probe did not run as hermes")
 
 class Lifecycle:
     def delete_remote_overlay(self):
@@ -77,8 +74,6 @@ def test_compatibility_image_packages_and_executes_runner_probe():
             [
                 "docker",
                 "build",
-                "--target",
-                "agent_saas_compatibility_contract",
                 "-f",
                 "Dockerfile.agent-saas-session-root",
                 "--build-arg",
@@ -101,7 +96,7 @@ def test_compatibility_image_packages_and_executes_runner_probe():
                 "docker",
                 "inspect",
                 "--format",
-                '{{index .Config.Labels "io.jubilee.hermes.patch-revision"}}',
+                '{{index .Config.Labels "io.jubilee.hermes.patch-revision"}} {{index .Config.Labels "org.opencontainers.image.base.digest"}}',
                 image,
             ],
             capture_output=True,
@@ -110,7 +105,7 @@ def test_compatibility_image_packages_and_executes_runner_probe():
             check=False,
         )
         assert revision.returncode == 0, revision.stderr
-        assert revision.stdout.strip() == _PATCH_REVISION
+        assert revision.stdout.strip() == f"{_PATCH_REVISION} {_OFFICIAL_BASE_DIGEST}"
 
         execution = subprocess.run(
             [
@@ -122,7 +117,7 @@ def test_compatibility_image_packages_and_executes_runner_probe():
                 "--workdir",
                 "/opt/hermes",
                 "--entrypoint",
-                "/usr/local/bin/python3",
+                "/opt/hermes/.venv/bin/python3",
                 image,
                 "-O",
                 "-c",
