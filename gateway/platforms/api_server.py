@@ -946,7 +946,11 @@ def _admit_api_agent_request(handler):
         if (
             sandbox_task_key
             and handler.__name__
-            not in {"_handle_chat_completions", "_handle_responses"}
+            not in {
+                "_handle_chat_completions",
+                "_handle_responses",
+                "_handle_dedicated_sandbox_canary",
+            }
         ):
             return web.json_response(
                 _openai_error(
@@ -1756,6 +1760,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/models", self._handle_models),
             ("GET", "/v1/capabilities", self._handle_capabilities),
             ("POST", "/v1/session-root-canary", self._handle_session_root_canary),
+            ("POST", "/v1/dedicated-sandbox-canary", self._handle_dedicated_sandbox_canary),
             ("GET", "/v1/workspace/files", self._handle_workspace_files),
             ("GET", "/v1/workspace/file", self._handle_workspace_file),
             ("GET", "/v1/skills", self._handle_skills),
@@ -2356,6 +2361,44 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return await asyncio.to_thread(sandbox_runner_ready_from_environment)
 
+    @_admit_api_agent_request
+    async def _handle_dedicated_sandbox_canary(
+        self,
+        request: "web.Request",
+    ) -> "web.Response":
+        """Run the authenticated per-task Runner isolation canary."""
+        if not self._sandbox_task_key_required:
+            return web.json_response(
+                _openai_error(
+                    "Dedicated sandbox canary is unavailable.",
+                    code="sandbox_runner_not_configured",
+                ),
+                status=503,
+            )
+        sandbox_task_key = request.get("hermes_sandbox_task_key")
+        if not sandbox_task_key:
+            return web.json_response(
+                _openai_error(
+                    "X-Hermes-Sandbox-Task-Key is required.",
+                    code="sandbox_task_key_required",
+                ),
+                status=400,
+            )
+        from tools.environments.sandbox_runner import (
+            run_sandbox_runner_isolation_canary,
+        )
+
+        checks = await asyncio.to_thread(
+            run_sandbox_runner_isolation_canary,
+            sandbox_task_key,
+        )
+        return web.json_response(
+            {
+                "source": "hermes.sandbox_runner_canary",
+                "checks": checks,
+            }
+        )
+
     async def _handle_health(self, request: "web.Request") -> "web.Response":
         """GET /health — simple health check."""
         if not await self._sandbox_runner_ready():
@@ -2750,6 +2793,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "sandbox_task_key_required": self._sandbox_task_key_required,
                 "sandbox_task_supported_endpoints": [
                     "/v1/chat/completions",
+                    "/v1/dedicated-sandbox-canary",
                     "/v1/responses",
                 ],
                 "session_root_header": (

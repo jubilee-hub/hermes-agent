@@ -48,6 +48,10 @@ def _app(adapter):
     app.router.add_get("/health/detailed", adapter._handle_health_detailed)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
     app.router.add_post("/v1/responses", adapter._handle_responses)
+    app.router.add_post(
+        "/v1/dedicated-sandbox-canary",
+        adapter._handle_dedicated_sandbox_canary,
+    )
     app.router.add_post("/v1/runs", adapter._handle_runs)
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
     return app
@@ -132,6 +136,76 @@ async def test_required_header_rejects_missing_malformed_and_unauthenticated_req
     assert malformed.status == 400
     assert malformed_body["error"]["code"] == "invalid_sandbox_task_key"
     assert unauthenticated.status == 401
+
+
+@pytest.mark.asyncio
+async def test_dedicated_canary_requires_auth_and_uses_only_header_task_identity(
+    tmp_path,
+):
+    adapter = _adapter(tmp_path)
+    checks = {
+        "sandboxTaskKeyHeaderAccepted": True,
+        "taskIdIsolated": True,
+        "taskIdFallbackNotDefault": True,
+        "workspaceBindingPresent": True,
+        "workspaceWriteRead": True,
+        "overlayMismatchDenied": True,
+        "secretEnvDenied": True,
+        "egressDenied": True,
+    }
+    app = _app(adapter)
+
+    with patch(
+        "tools.environments.sandbox_runner.run_sandbox_runner_isolation_canary",
+        return_value=checks,
+    ) as canary:
+        async with TestClient(TestServer(app)) as client:
+            unauthenticated = await client.post(
+                "/v1/dedicated-sandbox-canary",
+                headers={"X-Hermes-Sandbox-Task-Key": SANDBOX_A},
+                json={},
+            )
+            missing = await client.post(
+                "/v1/dedicated-sandbox-canary",
+                headers=AUTH,
+                json={},
+            )
+            response = await client.post(
+                "/v1/dedicated-sandbox-canary",
+                headers={**AUTH, "X-Hermes-Sandbox-Task-Key": SANDBOX_A},
+                json={},
+            )
+            payload = await response.json()
+
+    assert unauthenticated.status == 401
+    assert missing.status == 400
+    assert response.status == 200
+    assert payload == {
+        "source": "hermes.sandbox_runner_canary",
+        "checks": checks,
+    }
+    canary.assert_called_once_with(SANDBOX_A)
+
+
+@pytest.mark.asyncio
+async def test_dedicated_canary_rejects_non_split_runtime(tmp_path):
+    adapter = _adapter(tmp_path, required=False)
+    app = _app(adapter)
+
+    with patch(
+        "tools.environments.sandbox_runner.run_sandbox_runner_isolation_canary",
+    ) as canary:
+        async with TestClient(TestServer(app)) as client:
+            response = await client.post(
+                "/v1/dedicated-sandbox-canary",
+                headers={**AUTH, "X-Hermes-Sandbox-Task-Key": SANDBOX_A},
+                json={},
+            )
+            payload = await response.json()
+
+    assert response.status == 503
+    assert payload["error"]["code"] == "sandbox_runner_not_configured"
+    canary.assert_not_called()
 
 
 @pytest.mark.asyncio

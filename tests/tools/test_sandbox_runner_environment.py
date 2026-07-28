@@ -16,8 +16,10 @@ import pytest
 
 import tools.environments.sandbox_runner as sandbox_runner
 from tools.environments.sandbox_runner import (
+    SANDBOX_RUNNER_CANARY_CHECKS,
     SandboxRunnerEnvironment,
     read_sandbox_runner_artifact,
+    run_sandbox_runner_isolation_canary,
     sandbox_runner_ready_from_environment,
 )
 from tools.terminal_tool import scoped_task_env_overrides
@@ -209,6 +211,64 @@ def test_exec_uses_authenticated_uds_and_maps_bounded_result(runner_fixture):
     assert body["timeoutMs"] == 2000
     assert "printf user-command" in str(body["command"])
     assert "builtin cd -- /workspace/project" in str(body["command"])
+
+
+def test_isolation_canary_uses_fresh_primary_and_mismatch_executions(monkeypatch):
+    observed: list[tuple[str, str]] = []
+
+    class FakeEnvironment:
+        @staticmethod
+        def _validate_task_key(task_key):
+            return SandboxRunnerEnvironment._validate_task_key(task_key)
+
+        def __init__(self, *, task_key, **_kwargs):
+            self.task_key = task_key
+
+        def execute(self, command, **_kwargs):
+            observed.append((self.task_key, command))
+            if "python3 - <<'PY'" in command:
+                return {
+                    "returncode": 0,
+                    "output": "HERMES_SANDBOX_CANARY:"
+                    + json.dumps(
+                        {
+                            "workspaceBindingPresent": True,
+                            "workspaceWriteRead": True,
+                            "secretEnvDenied": True,
+                            "egressDenied": True,
+                        }
+                    ),
+                }
+            return {"returncode": 0, "output": ""}
+
+        def cleanup(self):
+            return None
+
+    monkeypatch.setattr(sandbox_runner, "SandboxRunnerEnvironment", FakeEnvironment)
+
+    checks = run_sandbox_runner_isolation_canary(TASK_KEY)
+
+    assert checks == {name: True for name in SANDBOX_RUNNER_CANARY_CHECKS}
+    assert len(observed) == 4
+    assert observed[0][0] == TASK_KEY
+    assert observed[1][0] == TASK_KEY
+    assert observed[2][0] != TASK_KEY
+    assert observed[2][0].startswith("sandbox-v1-")
+    assert observed[3][0] == TASK_KEY
+    assert "test -f /workspace/.agent-saas-canary-" in observed[1][1]
+    assert "test ! -e /workspace/.agent-saas-canary-" in observed[2][1]
+
+
+def test_isolation_canary_fails_closed_without_runner_transport(monkeypatch):
+    def unavailable_environment(*_args, **_kwargs):
+        raise RuntimeError("private transport detail")
+
+    monkeypatch.setattr(sandbox_runner, "SandboxRunnerEnvironment", unavailable_environment)
+
+    checks = run_sandbox_runner_isolation_canary(TASK_KEY)
+
+    assert checks == {name: False for name in SANDBOX_RUNNER_CANARY_CHECKS}
+    assert "private transport detail" not in json.dumps(checks)
 
 
 def test_artifact_export_uses_authenticated_uds_and_validates_the_task_bound_result(

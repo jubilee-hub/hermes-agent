@@ -36,6 +36,17 @@ _READINESS_REQUEST_TIMEOUT_SECONDS = 5.0
 _MAX_ARTIFACT_FILENAME_BYTES = 240
 _MIN_TOKEN_BYTES = 32
 _MAX_TOKEN_BYTES = 512
+SANDBOX_RUNNER_CANARY_CHECKS = (
+    "sandboxTaskKeyHeaderAccepted",
+    "taskIdIsolated",
+    "taskIdFallbackNotDefault",
+    "workspaceBindingPresent",
+    "workspaceWriteRead",
+    "overlayMismatchDenied",
+    "secretEnvDenied",
+    "egressDenied",
+)
+_CANARY_OUTPUT_PREFIX = "HERMES_SANDBOX_CANARY:"
 
 
 def _effective_uid() -> int:
@@ -597,6 +608,194 @@ def read_sandbox_runner_artifact(
         return environment.read_artifact(filename)
     finally:
         environment.cleanup()
+
+
+def run_sandbox_runner_isolation_canary(task_key: str) -> dict[str, bool]:
+    """Run bounded behavioral isolation checks through the real Runner."""
+    checks = {name: False for name in SANDBOX_RUNNER_CANARY_CHECKS}
+    environments: list[SandboxRunnerEnvironment] = []
+    try:
+        primary_key = SandboxRunnerEnvironment._validate_task_key(task_key)
+        mismatch_key = "sandbox-v1-" + base64.urlsafe_b64encode(
+            hashlib.sha256(
+                b"agent-saas-sandbox-canary-mismatch-v1\0"
+                + primary_key.encode("utf-8")
+            ).digest()
+        ).decode("ascii").rstrip("=")
+        mismatch_key = SandboxRunnerEnvironment._validate_task_key(mismatch_key)
+        marker = ".agent-saas-canary-" + hashlib.sha256(
+            b"agent-saas-sandbox-canary-marker-v1\0"
+            + primary_key.encode("utf-8")
+        ).hexdigest()[:24]
+
+        checks["sandboxTaskKeyHeaderAccepted"] = True
+        checks["taskIdIsolated"] = primary_key != mismatch_key
+        checks["taskIdFallbackNotDefault"] = (
+            primary_key != "default" and mismatch_key != "default"
+        )
+
+        primary = _canary_environment(primary_key)
+        environments.append(primary)
+        probe = primary.execute(
+            _canary_probe_script(marker),
+            cwd="/workspace",
+            timeout=15,
+        )
+        probe_checks = _parse_canary_probe(probe)
+        for name in (
+            "workspaceBindingPresent",
+            "workspaceWriteRead",
+            "secretEnvDenied",
+            "egressDenied",
+        ):
+            checks[name] = probe_checks.get(name) is True
+
+        persisted = _canary_environment(primary_key)
+        environments.append(persisted)
+        persistence_result = persisted.execute(
+            f"test -f /workspace/{marker}",
+            cwd="/workspace",
+            timeout=10,
+        )
+        checks["workspaceWriteRead"] = (
+            checks["workspaceWriteRead"]
+            and persistence_result.get("returncode") == 0
+        )
+
+        mismatch = _canary_environment(mismatch_key)
+        environments.append(mismatch)
+        mismatch_result = mismatch.execute(
+            f"test ! -e /workspace/{marker}",
+            cwd="/workspace",
+            timeout=10,
+        )
+        checks["overlayMismatchDenied"] = mismatch_result.get("returncode") == 0
+
+        cleanup = _canary_environment(primary_key)
+        environments.append(cleanup)
+        cleanup.execute(
+            f"rm -f /workspace/{marker}",
+            cwd="/workspace",
+            timeout=10,
+        )
+    except Exception:
+        return checks
+    finally:
+        for environment in environments:
+            try:
+                environment.cleanup()
+            except Exception:
+                pass
+    return checks
+
+
+def _canary_environment(task_key: str) -> SandboxRunnerEnvironment:
+    raw_token_fd = os.getenv(
+        "HERMES_SANDBOX_RUNNER_TOKEN_FD",
+        str(DEFAULT_TOKEN_FD),
+    )
+    try:
+        token_fd = int(raw_token_fd)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Sandbox runner credential is unavailable.") from exc
+    socket_path = os.getenv(
+        "HERMES_SANDBOX_RUNNER_SOCKET_PATH",
+        DEFAULT_SOCKET_PATH,
+    )
+    return SandboxRunnerEnvironment(
+        task_key=task_key,
+        socket_path=socket_path,
+        token_fd=token_fd,
+        cwd="/workspace",
+        initialize_session=False,
+    )
+
+
+def _canary_probe_script(marker: str) -> str:
+    marker_literal = json.dumps(marker)
+    return f"""python3 - <<'PY'
+import json
+import os
+import socket
+
+marker = {marker_literal}
+marker_path = "/workspace/" + marker
+checks = {{}}
+checks["workspaceBindingPresent"] = (
+    os.path.isdir("/workspace") and os.access("/workspace", os.W_OK)
+)
+try:
+    with open(marker_path, "w", encoding="utf-8") as stream:
+        stream.write(marker + "\\n")
+    with open(marker_path, "r", encoding="utf-8") as stream:
+        checks["workspaceWriteRead"] = stream.read().strip() == marker
+except Exception:
+    checks["workspaceWriteRead"] = False
+
+secret_prefixes = (
+    "API_SERVER_KEY",
+    "AWS_",
+    "AZURE_",
+    "COOLIFY_",
+    "DATABASE_URL",
+    "DIRECT_URL",
+    "GITHUB_",
+    "GOOGLE_",
+    "OP_",
+    "SSH_",
+    "KB_MCP_TOKEN",
+    "GEMINI_API_KEY",
+    "OPENAI_CODEX_TOKEN",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "AGENT_SAAS_ARTIFACT_BRIDGE",
+    "AGENT_SAAS_MEMORY_PROVIDER",
+    "AGENT_SAAS_BUSINESS_TOOLS",
+)
+secret_names = [
+    key for key in os.environ
+    if key.endswith("_API_KEY")
+    or key.endswith("_TOKEN")
+    or key.endswith("_PASSWORD")
+    or key.endswith("_SECRET")
+    or any(
+        key == prefix
+        or key.startswith(prefix if prefix.endswith("_") else prefix + "_")
+        for prefix in secret_prefixes
+    )
+]
+checks["secretEnvDenied"] = len(secret_names) == 0
+try:
+    connection = socket.create_connection(("1.1.1.1", 443), timeout=1.0)
+    connection.close()
+    egress_open = True
+except OSError:
+    egress_open = False
+checks["egressDenied"] = not egress_open
+print({_CANARY_OUTPUT_PREFIX!r} + json.dumps(checks, sort_keys=True))
+PY"""
+
+
+def _parse_canary_probe(result: dict[str, Any]) -> dict[str, bool]:
+    if result.get("returncode") != 0:
+        return {}
+    output = result.get("output")
+    if not isinstance(output, str):
+        return {}
+    for line in output.splitlines():
+        if not line.startswith(_CANARY_OUTPUT_PREFIX):
+            continue
+        try:
+            value = json.loads(line[len(_CANARY_OUTPUT_PREFIX):])
+        except json.JSONDecodeError:
+            return {}
+        if not isinstance(value, dict):
+            return {}
+        return {
+            str(name): item is True
+            for name, item in value.items()
+        }
+    return {}
 
 
 def sandbox_runner_ready_from_environment() -> bool:
