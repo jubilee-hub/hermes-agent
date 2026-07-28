@@ -152,6 +152,8 @@ async def test_dedicated_canary_requires_auth_and_uses_only_header_task_identity
         "overlayMismatchDenied": True,
         "secretEnvDenied": True,
         "egressDenied": True,
+        "primaryMarkerRemoved": True,
+        "mismatchOverlayRemoved": True,
     }
     app = _app(adapter)
 

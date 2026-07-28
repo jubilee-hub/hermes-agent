@@ -6,6 +6,8 @@ import json
 import os
 import socket
 import socketserver
+import subprocess
+import sys
 import threading
 import time
 import traceback
@@ -64,6 +66,11 @@ class _ThreadedUnixHTTPServer(
             },
             "limits": {"maxTimeoutMs": 300_000},
         }
+        self.cleanup_response: dict[str, object] = {
+            "schemaVersion": 1,
+            "ok": True,
+            "removed": True,
+        }
         super().__init__(socket_path, _RunnerHandler)
 
 
@@ -82,7 +89,12 @@ class _RunnerHandler(BaseHTTPRequestHandler):
         self.server.request_started.set()
         if self.server.block_response:
             self.server.release_response.wait(timeout=5)
-        payload = json.dumps(self.server.response).encode()
+        response = (
+            self.server.cleanup_response
+            if self.path == "/v1/cleanup"
+            else self.server.response
+        )
+        payload = json.dumps(response).encode()
         try:
             self.send_response(self.server.status)
             self.send_header("content-type", self.server.response_content_type)
@@ -213,8 +225,12 @@ def test_exec_uses_authenticated_uds_and_maps_bounded_result(runner_fixture):
     assert "builtin cd -- /workspace/project" in str(body["command"])
 
 
-def test_isolation_canary_uses_fresh_primary_and_mismatch_executions(monkeypatch):
+def test_isolation_canary_uses_isolated_probe_unique_nonce_and_removes_mismatch(
+    monkeypatch,
+):
     observed: list[tuple[str, str]] = []
+    deleted: list[str] = []
+    nonces = iter(("1" * 32, "2" * 32))
 
     class FakeEnvironment:
         @staticmethod
@@ -226,7 +242,7 @@ def test_isolation_canary_uses_fresh_primary_and_mismatch_executions(monkeypatch
 
         def execute(self, command, **_kwargs):
             observed.append((self.task_key, command))
-            if "python3 - <<'PY'" in command:
+            if "/usr/local/bin/python3 -I -S -P - <<'PY'" in command:
                 return {
                     "returncode": 0,
                     "output": "HERMES_SANDBOX_CANARY:"
@@ -241,22 +257,64 @@ def test_isolation_canary_uses_fresh_primary_and_mismatch_executions(monkeypatch
                 }
             return {"returncode": 0, "output": ""}
 
+        def delete_remote_overlay(self):
+            deleted.append(self.task_key)
+            return True
+
         def cleanup(self):
             return None
 
     monkeypatch.setattr(sandbox_runner, "SandboxRunnerEnvironment", FakeEnvironment)
+    monkeypatch.setattr(sandbox_runner.secrets, "token_hex", lambda _size: next(nonces))
 
-    checks = run_sandbox_runner_isolation_canary(TASK_KEY)
+    first = run_sandbox_runner_isolation_canary(TASK_KEY)
+    second = run_sandbox_runner_isolation_canary(TASK_KEY)
 
-    assert checks == {name: True for name in SANDBOX_RUNNER_CANARY_CHECKS}
-    assert len(observed) == 4
+    assert first == {name: True for name in SANDBOX_RUNNER_CANARY_CHECKS}
+    assert second == {name: True for name in SANDBOX_RUNNER_CANARY_CHECKS}
+    assert len(observed) == 8
     assert observed[0][0] == TASK_KEY
     assert observed[1][0] == TASK_KEY
     assert observed[2][0] != TASK_KEY
     assert observed[2][0].startswith("sandbox-v1-")
     assert observed[3][0] == TASK_KEY
+    assert observed[2][0] != observed[6][0]
+    assert deleted == [observed[2][0], observed[6][0]]
+    assert "cd / && /usr/local/bin/python3 -I -S -P -" in observed[0][1]
+    assert 'os.listdir("/sys/class/net")' in observed[0][1]
+    assert "socket.create_connection" not in observed[0][1]
     assert "test -f /workspace/.agent-saas-canary-" in observed[1][1]
     assert "test ! -e /workspace/.agent-saas-canary-" in observed[2][1]
+    assert observed[0][1] != observed[4][1]
+
+
+def test_isolated_python_flags_ignore_task_controlled_standard_library_shadow(
+    tmp_path,
+):
+    (tmp_path / "json.py").write_text(
+        "raise RuntimeError('task-controlled import executed')\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            "-P",
+            "-c",
+            "import json; print(json.dumps({'isolated': True}, sort_keys=True))",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout.strip() == '{"isolated": true}'
+    assert "task-controlled import executed" not in result.stderr
 
 
 def test_isolation_canary_fails_closed_without_runner_transport(monkeypatch):
@@ -701,6 +759,41 @@ def test_cleanup_does_not_delete_the_durable_remote_overlay(runner_fixture):
     environment.cleanup()
 
     assert server.requests == []
+
+
+def test_explicit_remote_overlay_delete_uses_authenticated_runner_cleanup(
+    runner_fixture,
+):
+    server, socket_path, token_fd = runner_fixture
+    environment = _environment(socket_path, token_fd)
+
+    assert environment.delete_remote_overlay() is True
+    assert server.requests == [
+        {
+            "path": "/v1/cleanup",
+            "authorization": f"Bearer {TOKEN}",
+            "contentType": "application/json",
+            "body": {
+                "schemaVersion": 1,
+                "taskKey": TASK_KEY,
+            },
+        }
+    ]
+
+
+def test_explicit_remote_overlay_delete_rejects_malformed_runner_response(
+    runner_fixture,
+):
+    server, socket_path, token_fd = runner_fixture
+    server.cleanup_response = {
+        "schemaVersion": 1,
+        "ok": True,
+        "removed": "yes",
+    }
+    environment = _environment(socket_path, token_fd)
+
+    with pytest.raises(RuntimeError, match="Sandbox runner response is invalid"):
+        environment.delete_remote_overlay()
 
 
 def test_existing_environment_reconnects_after_runner_restart(tmp_path: Path):

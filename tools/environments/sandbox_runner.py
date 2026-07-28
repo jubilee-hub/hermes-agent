@@ -13,6 +13,7 @@ import http.client
 import json
 import os
 import re
+import secrets
 import shlex
 import socket
 import stat
@@ -32,6 +33,7 @@ _MAX_RESPONSE_BYTES = 2 * 1_048_576 + 4096
 _MAX_ARTIFACT_BYTES = 16 * 1_048_576
 _MAX_ARTIFACT_RESPONSE_BYTES = ((_MAX_ARTIFACT_BYTES + 2) // 3) * 4 + 65_536
 _ARTIFACT_REQUEST_TIMEOUT_SECONDS = 35.0
+_CLEANUP_REQUEST_TIMEOUT_SECONDS = 15.0
 _READINESS_REQUEST_TIMEOUT_SECONDS = 5.0
 _MAX_ARTIFACT_FILENAME_BYTES = 240
 _MIN_TOKEN_BYTES = 32
@@ -45,6 +47,8 @@ SANDBOX_RUNNER_CANARY_CHECKS = (
     "overlayMismatchDenied",
     "secretEnvDenied",
     "egressDenied",
+    "primaryMarkerRemoved",
+    "mismatchOverlayRemoved",
 )
 _CANARY_OUTPUT_PREFIX = "HERMES_SANDBOX_CANARY:"
 
@@ -570,6 +574,62 @@ class SandboxRunnerEnvironment(BaseEnvironment):
         for call in calls:
             call.cancel()
 
+    def delete_remote_overlay(self) -> bool:
+        """Delete this task's durable overlay through the authenticated Runner."""
+        call = _CancelableRunnerCall()
+        with self._calls_lock:
+            if self._closed:
+                raise RuntimeError("Sandbox runner environment is closed.")
+            self._calls.add(call)
+        try:
+            self._assert_socket_ready()
+            payload = {
+                "schemaVersion": 1,
+                "taskKey": self._task_key,
+            }
+            body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            token = self._read_token()
+            connection = _UnixHTTPConnection(
+                self._socket_path,
+                timeout=_CLEANUP_REQUEST_TIMEOUT_SECONDS,
+            )
+            call.bind(connection)
+            try:
+                connection.request(
+                    "POST",
+                    "/v1/cleanup",
+                    body=body,
+                    headers={
+                        "authorization": f"Bearer {token}",
+                        "content-type": "application/json",
+                        "content-length": str(len(body)),
+                    },
+                )
+                response = connection.getresponse()
+                response_body = self._read_bounded_response(response)
+            finally:
+                call.release(connection)
+                connection.close()
+            if response.status != 200:
+                raise RuntimeError("Sandbox runner request was rejected.")
+            value = json.loads(response_body.decode("utf-8"))
+            if (
+                not isinstance(value, dict)
+                or set(value) != {"schemaVersion", "ok", "removed"}
+                or value.get("schemaVersion") != 1
+                or value.get("ok") is not True
+                or not isinstance(value.get("removed"), bool)
+            ):
+                raise RuntimeError("Sandbox runner response is invalid.")
+            return value["removed"]
+        except Exception as exc:
+            if isinstance(exc, RuntimeError) and str(exc).startswith("Sandbox runner "):
+                raise
+            raise RuntimeError("Sandbox runner cleanup failed closed.") from exc
+        finally:
+            with self._calls_lock:
+                self._calls.discard(call)
+
 
 def read_sandbox_runner_artifact(
     task_id: str,
@@ -614,19 +674,23 @@ def run_sandbox_runner_isolation_canary(task_key: str) -> dict[str, bool]:
     """Run bounded behavioral isolation checks through the real Runner."""
     checks = {name: False for name in SANDBOX_RUNNER_CANARY_CHECKS}
     environments: list[SandboxRunnerEnvironment] = []
+    primary_key: str | None = None
+    mismatch: SandboxRunnerEnvironment | None = None
+    mismatch_executed = False
+    marker: str | None = None
     try:
         primary_key = SandboxRunnerEnvironment._validate_task_key(task_key)
+        nonce = secrets.token_hex(16)
         mismatch_key = "sandbox-v1-" + base64.urlsafe_b64encode(
             hashlib.sha256(
                 b"agent-saas-sandbox-canary-mismatch-v1\0"
                 + primary_key.encode("utf-8")
+                + b"\0"
+                + nonce.encode("ascii")
             ).digest()
         ).decode("ascii").rstrip("=")
         mismatch_key = SandboxRunnerEnvironment._validate_task_key(mismatch_key)
-        marker = ".agent-saas-canary-" + hashlib.sha256(
-            b"agent-saas-sandbox-canary-marker-v1\0"
-            + primary_key.encode("utf-8")
-        ).hexdigest()[:24]
+        marker = ".agent-saas-canary-" + nonce
 
         checks["sandboxTaskKeyHeaderAccepted"] = True
         checks["taskIdIsolated"] = primary_key != mismatch_key
@@ -669,18 +733,30 @@ def run_sandbox_runner_isolation_canary(task_key: str) -> dict[str, bool]:
             cwd="/workspace",
             timeout=10,
         )
+        mismatch_executed = True
         checks["overlayMismatchDenied"] = mismatch_result.get("returncode") == 0
-
-        cleanup = _canary_environment(primary_key)
-        environments.append(cleanup)
-        cleanup.execute(
-            f"rm -f /workspace/{marker}",
-            cwd="/workspace",
-            timeout=10,
-        )
     except Exception:
-        return checks
+        pass
     finally:
+        if mismatch is not None and mismatch_executed:
+            try:
+                checks["mismatchOverlayRemoved"] = mismatch.delete_remote_overlay()
+            except Exception:
+                checks["mismatchOverlayRemoved"] = False
+        if primary_key is not None and marker is not None:
+            try:
+                cleanup = _canary_environment(primary_key)
+                environments.append(cleanup)
+                cleanup_result = cleanup.execute(
+                    f"rm -f /workspace/{marker} && test ! -e /workspace/{marker}",
+                    cwd="/workspace",
+                    timeout=10,
+                )
+                checks["primaryMarkerRemoved"] = (
+                    cleanup_result.get("returncode") == 0
+                )
+            except Exception:
+                checks["primaryMarkerRemoved"] = False
         for environment in environments:
             try:
                 environment.cleanup()
@@ -713,10 +789,9 @@ def _canary_environment(task_key: str) -> SandboxRunnerEnvironment:
 
 def _canary_probe_script(marker: str) -> str:
     marker_literal = json.dumps(marker)
-    return f"""python3 - <<'PY'
+    return f"""cd / && /usr/local/bin/python3 -I -S -P - <<'PY'
 import json
 import os
-import socket
 
 marker = {marker_literal}
 marker_path = "/workspace/" + marker
@@ -764,14 +839,19 @@ secret_names = [
         for prefix in secret_prefixes
     )
 ]
-checks["secretEnvDenied"] = len(secret_names) == 0
 try:
-    connection = socket.create_connection(("1.1.1.1", 443), timeout=1.0)
-    connection.close()
-    egress_open = True
-except OSError:
-    egress_open = False
-checks["egressDenied"] = not egress_open
+    interfaces = sorted(os.listdir("/sys/class/net"))
+    with open("/proc/net/route", "r", encoding="ascii") as stream:
+        route_rows = [
+            line.split()
+            for line in stream.read().splitlines()[1:]
+            if line.strip()
+        ]
+    non_loopback_route = any(row and row[0] != "lo" for row in route_rows)
+    checks["egressDenied"] = interfaces == ["lo"] and not non_loopback_route
+except Exception:
+    checks["egressDenied"] = False
+checks["secretEnvDenied"] = len(secret_names) == 0
 print({_CANARY_OUTPUT_PREFIX!r} + json.dumps(checks, sort_keys=True))
 PY"""
 
