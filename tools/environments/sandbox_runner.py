@@ -540,6 +540,7 @@ class SandboxRunnerEnvironment(BaseEnvironment):
         ):
             raise RuntimeError("Sandbox runner response is invalid.")
         return {
+            "taskRef": expected_task_ref,
             "filename": expected_filename,
             "sizeBytes": size_bytes,
             "checksumSha256": checksum,
