@@ -844,15 +844,29 @@ secret_names = [
     )
 ]
 try:
-    interfaces = sorted(os.listdir("/sys/class/net"))
+    with open("/proc/net/dev", "r", encoding="ascii") as stream:
+        interfaces = sorted(
+            line.split(":", 1)[0].strip()
+            for line in stream.read().splitlines()[2:]
+            if ":" in line
+        )
     with open("/proc/net/route", "r", encoding="ascii") as stream:
-        route_rows = [
+        ipv4_route_rows = [
             line.split()
             for line in stream.read().splitlines()[1:]
             if line.strip()
         ]
-    non_loopback_route = any(row and row[0] != "lo" for row in route_rows)
-    checks["egressDenied"] = interfaces == ["lo"] and not non_loopback_route
+    with open("/proc/net/ipv6_route", "r", encoding="ascii") as stream:
+        ipv6_route_rows = [
+            line.split()
+            for line in stream.read().splitlines()
+            if line.strip()
+        ]
+    checks["egressDenied"] = (
+        interfaces == ["lo"]
+        and all(row and row[0] == "lo" for row in ipv4_route_rows)
+        and all(len(row) >= 10 and row[9] == "lo" for row in ipv6_route_rows)
+    )
 except Exception:
     checks["egressDenied"] = False
 checks["secretEnvDenied"] = len(secret_names) == 0
