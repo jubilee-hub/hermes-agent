@@ -35,6 +35,7 @@ _MAX_ARTIFACT_RESPONSE_BYTES = ((_MAX_ARTIFACT_BYTES + 2) // 3) * 4 + 65_536
 _ARTIFACT_REQUEST_TIMEOUT_SECONDS = 35.0
 _CLEANUP_REQUEST_TIMEOUT_SECONDS = 15.0
 _READINESS_REQUEST_TIMEOUT_SECONDS = 5.0
+_CANARY_EXECUTION_TIMEOUT_SECONDS = 30
 _MAX_ARTIFACT_FILENAME_BYTES = 240
 _MIN_TOKEN_BYTES = 32
 _MAX_TOKEN_BYTES = 512
@@ -703,7 +704,7 @@ def run_sandbox_runner_isolation_canary(task_key: str) -> dict[str, bool]:
         probe = primary.execute(
             _canary_probe_script(marker),
             cwd="/workspace",
-            timeout=15,
+            timeout=_CANARY_EXECUTION_TIMEOUT_SECONDS,
         )
         probe_checks = _parse_canary_probe(probe)
         for name in (
@@ -719,7 +720,7 @@ def run_sandbox_runner_isolation_canary(task_key: str) -> dict[str, bool]:
         persistence_result = persisted.execute(
             f"test -f /workspace/{marker}",
             cwd="/workspace",
-            timeout=10,
+            timeout=_CANARY_EXECUTION_TIMEOUT_SECONDS,
         )
         checks["workspaceWriteRead"] = (
             checks["workspaceWriteRead"]
@@ -731,7 +732,7 @@ def run_sandbox_runner_isolation_canary(task_key: str) -> dict[str, bool]:
         mismatch_result = mismatch.execute(
             f"test ! -e /workspace/{marker}",
             cwd="/workspace",
-            timeout=10,
+            timeout=_CANARY_EXECUTION_TIMEOUT_SECONDS,
         )
         mismatch_executed = True
         checks["overlayMismatchDenied"] = mismatch_result.get("returncode") == 0
@@ -754,7 +755,7 @@ def run_sandbox_runner_isolation_canary(task_key: str) -> dict[str, bool]:
                 cleanup_result = cleanup.execute(
                     f"rm -f /workspace/{marker} && test ! -e /workspace/{marker}",
                     cwd="/workspace",
-                    timeout=10,
+                    timeout=_CANARY_EXECUTION_TIMEOUT_SECONDS,
                 )
                 checks["primaryMarkerRemoved"] = (
                     cleanup_result.get("returncode") == 0

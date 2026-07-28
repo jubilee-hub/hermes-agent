@@ -229,6 +229,7 @@ def test_isolation_canary_uses_isolated_probe_unique_nonce_and_removes_mismatch(
     monkeypatch,
 ):
     observed: list[tuple[str, str]] = []
+    observed_timeouts: list[int | None] = []
     deleted: list[str] = []
     nonces = iter(("1" * 32, "2" * 32))
 
@@ -242,6 +243,7 @@ def test_isolation_canary_uses_isolated_probe_unique_nonce_and_removes_mismatch(
 
         def execute(self, command, **_kwargs):
             observed.append((self.task_key, command))
+            observed_timeouts.append(_kwargs.get("timeout"))
             if "/usr/local/bin/python3 -I -S -P - <<'PY'" in command:
                 return {
                     "returncode": 0,
@@ -273,6 +275,7 @@ def test_isolation_canary_uses_isolated_probe_unique_nonce_and_removes_mismatch(
     assert first == {name: True for name in SANDBOX_RUNNER_CANARY_CHECKS}
     assert second == {name: True for name in SANDBOX_RUNNER_CANARY_CHECKS}
     assert len(observed) == 8
+    assert observed_timeouts == [30] * 8
     assert observed[0][0] == TASK_KEY
     assert observed[1][0] == TASK_KEY
     assert observed[2][0] != TASK_KEY
