@@ -7,6 +7,7 @@ import os
 import socket
 import socketserver
 import threading
+import time
 import traceback
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
@@ -48,6 +49,7 @@ class _ThreadedUnixHTTPServer(
         self.release_response = threading.Event()
         self.disconnect_observed = threading.Event()
         self.block_response = False
+        self.health_delay_seconds = 0.0
         self.capabilities: dict[str, object] = {
             "schemaVersion": 1,
             "isolation": "per_task_overlay",
@@ -90,6 +92,7 @@ class _RunnerHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/health":
+            time.sleep(self.server.health_delay_seconds)
             payload = {
                 "schemaVersion": 1,
                 "status": "ready",
@@ -485,6 +488,45 @@ def test_live_readiness_requires_the_exact_artifact_export_policy(
     artifact_export = server.capabilities["artifactExport"]
     assert isinstance(artifact_export, dict)
     artifact_export["pathPolicy"] = "unsafe_follow"
+    assert sandbox_runner_ready_from_environment() is False
+
+
+def test_live_readiness_allows_a_bounded_slow_host_probe(
+    runner_fixture,
+    monkeypatch,
+):
+    server, socket_path, token_fd = runner_fixture
+    server.health_delay_seconds = 2.1
+    monkeypatch.setenv("HERMES_SANDBOX_RUNNER_SOCKET_PATH", str(socket_path))
+    monkeypatch.setenv("HERMES_SANDBOX_RUNNER_TOKEN_FD", str(token_fd))
+    monkeypatch.setattr(
+        sandbox_runner,
+        "_effective_uid",
+        lambda: os.fstat(token_fd).st_uid + 1,
+    )
+
+    assert sandbox_runner_ready_from_environment() is True
+
+
+def test_live_readiness_still_fails_closed_after_its_bounded_timeout(
+    runner_fixture,
+    monkeypatch,
+):
+    server, socket_path, token_fd = runner_fixture
+    server.health_delay_seconds = 0.2
+    monkeypatch.setenv("HERMES_SANDBOX_RUNNER_SOCKET_PATH", str(socket_path))
+    monkeypatch.setenv("HERMES_SANDBOX_RUNNER_TOKEN_FD", str(token_fd))
+    monkeypatch.setattr(
+        sandbox_runner,
+        "_effective_uid",
+        lambda: os.fstat(token_fd).st_uid + 1,
+    )
+    monkeypatch.setattr(
+        sandbox_runner,
+        "_READINESS_REQUEST_TIMEOUT_SECONDS",
+        0.05,
+    )
+
     assert sandbox_runner_ready_from_environment() is False
 
 

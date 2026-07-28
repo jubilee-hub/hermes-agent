@@ -32,6 +32,7 @@ _MAX_RESPONSE_BYTES = 2 * 1_048_576 + 4096
 _MAX_ARTIFACT_BYTES = 16 * 1_048_576
 _MAX_ARTIFACT_RESPONSE_BYTES = ((_MAX_ARTIFACT_BYTES + 2) // 3) * 4 + 65_536
 _ARTIFACT_REQUEST_TIMEOUT_SECONDS = 35.0
+_READINESS_REQUEST_TIMEOUT_SECONDS = 5.0
 _MAX_ARTIFACT_FILENAME_BYTES = 240
 _MIN_TOKEN_BYTES = 32
 _MAX_TOKEN_BYTES = 512
@@ -662,7 +663,10 @@ def _runner_probe_json(
     path: str,
     token: str | None,
 ) -> dict[str, Any]:
-    connection = _UnixHTTPConnection(socket_path, timeout=2.0)
+    connection = _UnixHTTPConnection(
+        socket_path,
+        timeout=_READINESS_REQUEST_TIMEOUT_SECONDS,
+    )
     headers = {"accept": "application/json"}
     if token is not None:
         headers["authorization"] = f"Bearer {token}"
