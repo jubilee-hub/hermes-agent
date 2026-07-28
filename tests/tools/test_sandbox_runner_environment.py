@@ -7,6 +7,7 @@ import os
 import socket
 import socketserver
 import threading
+import traceback
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
@@ -236,6 +237,21 @@ def test_artifact_export_uses_authenticated_uds_and_validates_the_task_bound_res
     ]
 
 
+def test_artifact_export_accepts_an_integrity_valid_empty_file(runner_fixture):
+    server, socket_path, token_fd = runner_fixture
+    server.response = _artifact_response(TASK_KEY, content=b"")
+    environment = _environment(socket_path, token_fd)
+
+    result = environment.read_artifact("report.bin")
+
+    assert result == {
+        "filename": "report.bin",
+        "sizeBytes": 0,
+        "checksumSha256": hashlib.sha256(b"").hexdigest(),
+        "contentBase64": "",
+    }
+
+
 def test_request_scoped_artifact_helper_never_reuses_another_task_capability(
     runner_fixture,
     monkeypatch,
@@ -382,6 +398,27 @@ def test_artifact_export_rechecks_socket_and_token_metadata(runner_fixture):
     os.fchmod(token_fd, 0o644)
     with pytest.raises(RuntimeError, match="credential is unavailable"):
         environment.read_artifact("report.bin")
+    assert server.requests == []
+
+
+def test_artifact_export_suppresses_transport_cause_and_socket_path(runner_fixture):
+    server, socket_path, token_fd = runner_fixture
+    environment = _environment(socket_path, token_fd)
+    socket_path.unlink()
+
+    with pytest.raises(RuntimeError, match="transport is unavailable") as exc_info:
+        environment.read_artifact("report.bin")
+
+    rendered = "".join(
+        traceback.format_exception(
+            type(exc_info.value),
+            exc_info.value,
+            exc_info.value.__traceback__,
+        )
+    )
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__suppress_context__ is True
+    assert str(socket_path) not in rendered
     assert server.requests == []
 
 

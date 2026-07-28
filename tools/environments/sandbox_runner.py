@@ -451,8 +451,10 @@ class SandboxRunnerEnvironment(BaseEnvironment):
             )
         except Exception as exc:
             if isinstance(exc, RuntimeError) and str(exc).startswith("Sandbox runner "):
-                raise
-            raise RuntimeError("Sandbox runner artifact export failed closed.") from exc
+                raise RuntimeError(str(exc)) from None
+            raise RuntimeError(
+                "Sandbox runner artifact export failed closed."
+            ) from None
 
     @staticmethod
     def _validate_artifact_filename(filename: str) -> str:
@@ -515,7 +517,7 @@ class SandboxRunnerEnvironment(BaseEnvironment):
             or value.get("filename") != expected_filename
             or isinstance(size_bytes, bool)
             or not isinstance(size_bytes, int)
-            or size_bytes < 1
+            or size_bytes < 0
             or size_bytes > _MAX_ARTIFACT_BYTES
             or not isinstance(checksum, str)
             or not re.fullmatch(r"[a-f0-9]{64}", checksum)
