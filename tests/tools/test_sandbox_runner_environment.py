@@ -218,6 +218,7 @@ def test_artifact_export_uses_authenticated_uds_and_validates_the_task_bound_res
     result = environment.read_artifact("report.bin")
 
     assert result == {
+        "taskRef": _task_ref(TASK_KEY),
         "filename": "report.bin",
         "sizeBytes": len(b"artifact-bytes"),
         "checksumSha256": hashlib.sha256(b"artifact-bytes").hexdigest(),
@@ -245,6 +246,7 @@ def test_artifact_export_accepts_an_integrity_valid_empty_file(runner_fixture):
     result = environment.read_artifact("report.bin")
 
     assert result == {
+        "taskRef": _task_ref(TASK_KEY),
         "filename": "report.bin",
         "sizeBytes": 0,
         "checksumSha256": hashlib.sha256(b"").hexdigest(),
@@ -276,6 +278,8 @@ def test_request_scoped_artifact_helper_never_reuses_another_task_capability(
         ):
             result = read_sandbox_runner_artifact(task_id, "report.bin")
         assert base64.b64decode(result["contentBase64"], validate=True) == content
+        assert result["taskRef"] == _task_ref(task_key)
+        assert task_key not in json.dumps(result)
         assert server.requests[-1]["body"]["taskKey"] == task_key
 
         with pytest.raises(
