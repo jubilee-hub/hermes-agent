@@ -417,6 +417,7 @@ def test_artifact_export_suppresses_transport_cause_and_socket_path(runner_fixtu
         )
     )
     assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
     assert exc_info.value.__suppress_context__ is True
     assert str(socket_path) not in rendered
     assert server.requests == []
