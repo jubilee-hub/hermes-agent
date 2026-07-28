@@ -408,6 +408,7 @@ class SandboxRunnerEnvironment(BaseEnvironment):
         call: _CancelableRunnerCall,
         filename: str,
     ) -> dict[str, Any]:
+        safe_error: str | None = None
         try:
             self._assert_socket_ready()
             payload = {
@@ -451,8 +452,13 @@ class SandboxRunnerEnvironment(BaseEnvironment):
             )
         except Exception as exc:
             if isinstance(exc, RuntimeError) and str(exc).startswith("Sandbox runner "):
-                raise
-            raise RuntimeError("Sandbox runner artifact export failed closed.") from exc
+                safe_error = str(exc)
+            else:
+                safe_error = "Sandbox runner artifact export failed closed."
+
+        # Raise after the except block so the new stable exception has neither
+        # a cause nor a hidden context chain back to transport paths/details.
+        raise RuntimeError(safe_error) from None
 
     @staticmethod
     def _validate_artifact_filename(filename: str) -> str:
@@ -515,7 +521,7 @@ class SandboxRunnerEnvironment(BaseEnvironment):
             or value.get("filename") != expected_filename
             or isinstance(size_bytes, bool)
             or not isinstance(size_bytes, int)
-            or size_bytes < 1
+            or size_bytes < 0
             or size_bytes > _MAX_ARTIFACT_BYTES
             or not isinstance(checksum, str)
             or not re.fullmatch(r"[a-f0-9]{64}", checksum)
