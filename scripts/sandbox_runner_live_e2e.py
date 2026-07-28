@@ -55,11 +55,15 @@ def run_live_cold_overlay_e2e() -> None:
     task_key = _unique_task_key()
     lifecycle = _environment(task_key)
     try:
-        assert lifecycle.delete_remote_overlay() is False
+        if lifecycle.delete_remote_overlay() is not False:
+            raise RuntimeError("Cold-overlay precondition failed closed.")
         checks = run_sandbox_runner_isolation_canary(task_key)
-        assert checks == {name: True for name in SANDBOX_RUNNER_CANARY_CHECKS}
-        assert lifecycle.delete_remote_overlay() is True
-        assert lifecycle.delete_remote_overlay() is False
+        if checks != {name: True for name in SANDBOX_RUNNER_CANARY_CHECKS}:
+            raise RuntimeError("Cold-overlay canary failed closed.")
+        if lifecycle.delete_remote_overlay() is not True:
+            raise RuntimeError("Cold-overlay cleanup failed closed.")
+        if lifecycle.delete_remote_overlay() is not False:
+            raise RuntimeError("Cold-overlay cleanup verification failed closed.")
     finally:
         try:
             lifecycle.delete_remote_overlay()
