@@ -6,6 +6,33 @@
 # read-only Docker Hub cache. The tag and immutable digest below resolve to
 # the exact official index, avoiding regional blob truncation without changing
 # the verified image bytes.
+# Only the production modules, live Runner probe, and startup permission hook
+# required by the Agent SaaS compatibility contract are overlaid. Everything
+# else remains byte-for-byte from the pinned official image.
+FROM python:3.13-alpine@sha256:399babc8b49529dabfd9c922f2b5eea81d611e4512e3ed250d75bd2e7683f4b0 AS agent_saas_compatibility_overlay
+COPY --chown=0:0 agent/runtime_cwd.py /overlay/opt/hermes/agent/runtime_cwd.py
+COPY --chown=0:0 gateway/session_context.py /overlay/opt/hermes/gateway/session_context.py
+COPY --chown=0:0 gateway/platforms/api_server.py /overlay/opt/hermes/gateway/platforms/api_server.py
+COPY --chown=0:0 tools/file_tools.py /overlay/opt/hermes/tools/file_tools.py
+COPY --chown=0:0 tools/environments/sandbox_runner.py /overlay/opt/hermes/tools/environments/sandbox_runner.py
+COPY --chown=0:0 scripts/sandbox_runner_live_e2e.py /overlay/opt/hermes/scripts/sandbox_runner_live_e2e.py
+COPY --chown=0:0 docker/agent-saas-workspace-perms.sh /overlay/etc/cont-init.d/03-agent-saas-workspace-perms
+RUN find /overlay -type d -exec chmod 0755 {} + && \
+    find /overlay -type f -exec chmod 0444 {} + && \
+    chmod 0555 \
+      /overlay/opt/hermes/scripts/sandbox_runner_live_e2e.py \
+      /overlay/etc/cont-init.d/03-agent-saas-workspace-perms
+
+# Normal Python CI builds this lightweight contract target and runs it as the
+# production UID. The final image below consumes the exact same overlay stage.
+FROM python:3.13-alpine@sha256:399babc8b49529dabfd9c922f2b5eea81d611e4512e3ed250d75bd2e7683f4b0 AS agent_saas_compatibility_contract
+ARG PATCH_REVISION
+LABEL io.jubilee.hermes.patch-revision="${PATCH_REVISION}"
+RUN addgroup -g 10000 hermes && \
+    adduser -D -u 10000 -G hermes -h /opt/data hermes
+WORKDIR /opt/hermes
+COPY --from=agent_saas_compatibility_overlay /overlay/ /
+
 FROM mirror.gcr.io/nousresearch/hermes-agent:v2026.7.20@sha256:f7b35053268f532f98955195c909f15a230470fbcbdacaa9fdecb95707dad04a
 
 ARG PATCH_REVISION
@@ -20,13 +47,4 @@ LABEL org.opencontainers.image.source="https://github.com/jubilee-hub/hermes-age
       io.jubilee.agent-saas.parent-issue="jubilee-hub/agent-saas#140" \
       io.jubilee.agent-saas.image-issue="jubilee-hub/agent-saas#700"
 
-# Only the production modules, live Runner probe, and startup permission hook
-# required by the Agent SaaS compatibility contract are overlaid. Everything
-# else remains byte-for-byte from the pinned official image.
-COPY --chown=root:root --chmod=0444 agent/runtime_cwd.py /opt/hermes/agent/runtime_cwd.py
-COPY --chown=root:root --chmod=0444 gateway/session_context.py /opt/hermes/gateway/session_context.py
-COPY --chown=root:root --chmod=0444 gateway/platforms/api_server.py /opt/hermes/gateway/platforms/api_server.py
-COPY --chown=root:root --chmod=0444 tools/file_tools.py /opt/hermes/tools/file_tools.py
-COPY --chown=root:root --chmod=0444 tools/environments/sandbox_runner.py /opt/hermes/tools/environments/sandbox_runner.py
-COPY --chown=root:root --chmod=0555 scripts/sandbox_runner_live_e2e.py /opt/hermes/scripts/sandbox_runner_live_e2e.py
-COPY --chown=root:root --chmod=0555 docker/agent-saas-workspace-perms.sh /etc/cont-init.d/03-agent-saas-workspace-perms
+COPY --from=agent_saas_compatibility_overlay /overlay/ /
