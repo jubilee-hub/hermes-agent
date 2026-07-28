@@ -694,17 +694,19 @@ def _get_or_create_env(task_id: str):
     from tools.terminal_tool import (
         _active_environments, _env_lock, _create_environment,
         _get_env_config, _last_activity, _start_cleanup_thread,
-        _creation_locks, _creation_locks_lock, _task_env_overrides,
-        _resolve_container_task_id,
+        _creation_locks, _creation_locks_lock, _resolve_container_task_id,
+        resolve_task_env_type, resolve_task_overrides,
     )
 
     effective_task_id = _resolve_container_task_id(task_id)
+    config = _get_env_config()
+    env_type = resolve_task_env_type(task_id, config["env_type"])
 
     # Fast path: environment already exists
     with _env_lock:
         if effective_task_id in _active_environments:
             _last_activity[effective_task_id] = time.time()
-            return _active_environments[effective_task_id], _get_env_config()["env_type"]
+            return _active_environments[effective_task_id], env_type
 
     # Slow path: create environment (same pattern as file_tools._get_file_ops)
     with _creation_locks_lock:
@@ -716,11 +718,9 @@ def _get_or_create_env(task_id: str):
         with _env_lock:
             if effective_task_id in _active_environments:
                 _last_activity[effective_task_id] = time.time()
-                return _active_environments[effective_task_id], _get_env_config()["env_type"]
+                return _active_environments[effective_task_id], env_type
 
-        config = _get_env_config()
-        env_type = config["env_type"]
-        overrides = _task_env_overrides.get(effective_task_id, {})
+        overrides = resolve_task_overrides(task_id)
 
         if env_type == "docker":
             image = overrides.get("docker_image") or config["docker_image"]
@@ -733,7 +733,11 @@ def _get_or_create_env(task_id: str):
         else:
             image = ""
 
-        cwd = overrides.get("cwd") or config["cwd"]
+        cwd = (
+            "/workspace"
+            if env_type == "sandbox_runner"
+            else (overrides.get("cwd") or config["cwd"])
+        )
 
         container_config = None
         if env_type in {"docker", "singularity", "modal", "daytona"}:
@@ -1075,13 +1079,6 @@ def _execute_remote(
 
         stdout_text = script_result.get("output", "") or ""
         exit_code = script_result.get("returncode", -1)
-        status = "success"
-
-        # Check for timeout/interrupt from the backend
-        if exit_code == 124:
-            status = "timeout"
-        elif exit_code == 130:
-            status = "interrupted"
 
     except Exception as exc:
         duration = round(time.monotonic() - exec_start, 2)
@@ -1111,28 +1108,122 @@ def _execute_remote(
         except Exception:
             logger.debug("Failed to clean up remote sandbox %s", sandbox_dir)
 
-    duration = round(time.monotonic() - exec_start, 2)
+    return _format_remote_execution_result(
+        stdout_text=stdout_text,
+        exit_code=exit_code,
+        timeout=timeout,
+        duration=round(time.monotonic() - exec_start, 2),
+        tool_calls_made=tool_call_counter[0],
+        backend_label="remote",
+    )
 
-    # --- Post-process output (same as local path) ---
+
+def _execute_sandbox_runner_code(
+    code: str,
+    task_id: Optional[str],
+    enabled_tools: Optional[List[str]],
+) -> str:
+    """Execute Python in one bounded Runner request.
+
+    The generic remote backend uses a second concurrent command to poll a
+    file-based tool RPC directory. Sandbox Runner deliberately serializes one
+    task key, so that pattern would deadlock whenever the script calls a tool.
+    The controlled backend therefore supports code execution only, with no
+    nested Hermes-tool RPC; ordinary tools remain separate top-level calls.
+    """
+    del enabled_tools
+    config = _load_config()
+    timeout = config.get("timeout", DEFAULT_TIMEOUT)
+    started = time.monotonic()
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, (int, float))
+        or timeout < 0.1
+        or timeout > 300
+    ):
+        return json.dumps(
+            {
+                "status": "error",
+                "error": (
+                    "Sandbox Runner code timeout is outside the supported boundary."
+                ),
+                "tool_calls_made": 0,
+                "duration_seconds": 0,
+            },
+            ensure_ascii=False,
+        )
+
+    try:
+        environment, env_type = _get_or_create_env(task_id or "default")
+        if env_type != "sandbox_runner":
+            raise RuntimeError("Sandbox Runner execution backend is unavailable.")
+        script_result = environment.execute(
+            "PYTHONDONTWRITEBYTECODE=1 python3 -",
+            cwd="/workspace",
+            timeout=timeout,
+            stdin_data=code,
+        )
+        stdout_text = script_result.get("output", "") or ""
+        exit_code = script_result.get("returncode", -1)
+    except Exception as exc:
+        duration = round(time.monotonic() - started, 2)
+        logger.error(
+            "execute_code sandbox_runner failed after %ss: %s",
+            duration,
+            type(exc).__name__,
+        )
+        return json.dumps(
+            {
+                "status": "error",
+                "error": "Sandbox Runner code execution failed closed.",
+                "tool_calls_made": 0,
+                "duration_seconds": duration,
+            },
+            ensure_ascii=False,
+        )
+
+    return _format_remote_execution_result(
+        stdout_text=stdout_text,
+        exit_code=exit_code,
+        timeout=timeout,
+        duration=round(time.monotonic() - started, 2),
+        tool_calls_made=0,
+        backend_label="sandbox_runner",
+    )
+
+
+def _format_remote_execution_result(
+    *,
+    stdout_text: str,
+    exit_code: int,
+    timeout: int | float,
+    duration: float,
+    tool_calls_made: int,
+    backend_label: str,
+) -> str:
+    status = "success"
+    if exit_code == 124:
+        status = "timeout"
+    elif exit_code == 130:
+        status = "interrupted"
 
     stdout_text, stdout_metadata = _truncate_stdout_text(stdout_text)
 
-    # Strip ANSI escape sequences
     from tools.ansi_strip import strip_ansi
+
     stdout_text = strip_ansi(stdout_text)
 
-    # Redact secrets. code_file=True: execute_code output is code-execution
-    # output that often echoes source/config — skip false-positive ENV/JSON/
-    # f-string-template redaction while still masking real credentials.
+    # Code output can echo source/config. Keep code-aware redaction while
+    # masking actual credentials before returning anything to the model.
     from agent.redact import redact_sensitive_text
+
     stdout_text = redact_sensitive_text(stdout_text, code_file=True)
 
-    # Build response
     result: Dict[str, Any] = {
         "status": status,
         "output": stdout_text,
         "exit_code": exit_code,
-        "tool_calls_made": tool_call_counter[0],
+        "tool_calls_made": tool_calls_made,
         "duration_seconds": duration,
     }
     result.update(stdout_metadata)
@@ -1140,15 +1231,17 @@ def _execute_remote(
     if status == "timeout":
         timeout_msg = f"Script timed out after {timeout}s and was killed."
         result["error"] = timeout_msg
-        # Include timeout message in output so the LLM always surfaces it
-        # to the user (see local path comment — same reasoning, #10807).
-        if stdout_text:
-            result["output"] = stdout_text + f"\n\n⏰ {timeout_msg}"
-        else:
-            result["output"] = f"⏰ {timeout_msg}"
+        result["output"] = (
+            stdout_text + f"\n\n⏰ {timeout_msg}"
+            if stdout_text
+            else f"⏰ {timeout_msg}"
+        )
         logger.warning(
-            "execute_code (remote) timed out after %ss (limit %ss) with %d tool calls",
-            duration, timeout, tool_call_counter[0],
+            "execute_code (%s) timed out after %ss (limit %ss) with %d tool calls",
+            backend_label,
+            duration,
+            timeout,
+            tool_calls_made,
         )
     elif status == "interrupted":
         result["output"] = (
@@ -1196,9 +1289,13 @@ def execute_code(
         return tool_error("No code provided.")
 
     # Dispatch: remote backends use file-based RPC, local uses UDS
-    from tools.terminal_tool import _get_env_config, _docker_has_host_access
+    from tools.terminal_tool import (
+        _get_env_config,
+        _docker_has_host_access,
+        resolve_task_env_type,
+    )
     _env_config = _get_env_config()
-    env_type = _env_config["env_type"]
+    env_type = resolve_task_env_type(task_id, _env_config["env_type"])
 
     # execute_code runs arbitrary Python (subprocess/os.system/...) that never
     # passes through terminal()/DANGEROUS_PATTERNS, so guard the whole script
@@ -1228,6 +1325,9 @@ def execute_code(
     if _guard.get("user_approved"):
         from tools.interrupt import clear_current_thread_interrupt
         clear_current_thread_interrupt()
+
+    if env_type == "sandbox_runner":
+        return _execute_sandbox_runner_code(code, task_id, enabled_tools)
 
     if env_type != "local":
         return _execute_remote(code, task_id, enabled_tools)

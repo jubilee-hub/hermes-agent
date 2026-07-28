@@ -1,5 +1,7 @@
 """Focused tests for API server session-control endpoints."""
 
+import asyncio
+import threading
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -76,9 +78,11 @@ async def test_capabilities_advertises_session_control_surface(adapter):
 
 
 @pytest.mark.asyncio
-async def test_run_agent_binds_api_session_context_for_tool_env(adapter, monkeypatch):
+async def test_run_agent_binds_api_session_context_for_tool_env(adapter, monkeypatch, tmp_path):
     """API-server request sessions should reach tools and terminal subprocess env."""
     monkeypatch.setenv("HERMES_SESSION_ID", "stale-session")
+    session_root = tmp_path / "request-session"
+    session_root.mkdir()
     observed = {}
 
     class FakeAgent:
@@ -90,6 +94,7 @@ async def test_run_agent_binds_api_session_context_for_tool_env(adapter, monkeyp
             self.session_id = session_id
 
         def run_conversation(self, user_message, conversation_history, task_id):
+            from agent.runtime_cwd import resolve_agent_cwd, resolve_session_file_root
             from gateway.session_context import get_session_env
             from tools.environments.local import _make_run_env
 
@@ -97,6 +102,8 @@ async def test_run_agent_binds_api_session_context_for_tool_env(adapter, monkeyp
             observed["context_session_id"] = get_session_env("HERMES_SESSION_ID")
             observed["context_platform"] = get_session_env("HERMES_SESSION_PLATFORM")
             observed["context_session_key"] = get_session_env("HERMES_SESSION_KEY")
+            observed["agent_cwd"] = str(resolve_agent_cwd())
+            observed["file_root"] = str(resolve_session_file_root())
             observed["child_session_id"] = _make_run_env({}).get("HERMES_SESSION_ID")
             return {"final_response": "ok"}
 
@@ -110,6 +117,7 @@ async def test_run_agent_binds_api_session_context_for_tool_env(adapter, monkeyp
         conversation_history=[],
         session_id="request-session",
         gateway_session_key="request-key",
+        session_root=str(session_root),
     )
 
     assert result["session_id"] == "request-session"
@@ -119,8 +127,193 @@ async def test_run_agent_binds_api_session_context_for_tool_env(adapter, monkeyp
         "context_session_id": "request-session",
         "context_platform": "api_server",
         "context_session_key": "request-key",
+        "agent_cwd": str(session_root),
+        "file_root": str(session_root),
         "child_session_id": "request-session",
     }
+
+
+@pytest.mark.asyncio
+async def test_run_agent_fails_closed_when_session_root_binding_fails(
+    adapter,
+    monkeypatch,
+    tmp_path,
+):
+    agent_created = False
+
+    def fake_create_agent(**_kwargs):
+        nonlocal agent_created
+        agent_created = True
+        raise AssertionError("agent creation must not run after a root binding failure")
+
+    def fail_root_binding(_root):
+        raise RuntimeError("root binding unavailable")
+
+    monkeypatch.setattr(adapter, "_create_agent", fake_create_agent)
+    monkeypatch.setattr(
+        "agent.runtime_cwd.set_session_file_root",
+        fail_root_binding,
+    )
+
+    with pytest.raises(RuntimeError, match="root binding unavailable"):
+        await adapter._run_agent(
+            user_message="hello",
+            conversation_history=[],
+            session_id="binding-failure",
+            session_root=str(tmp_path),
+        )
+
+    assert agent_created is False
+
+
+@pytest.mark.asyncio
+async def test_concurrent_api_runs_keep_session_roots_isolated(adapter, monkeypatch, tmp_path):
+    roots = {
+        "session-a": tmp_path / "user-a",
+        "session-b": tmp_path / "user-b",
+    }
+    for root in roots.values():
+        root.mkdir()
+    barrier = threading.Barrier(2)
+    observed = {}
+
+    class RootObservingAgent:
+        session_prompt_tokens = 0
+        session_completion_tokens = 0
+        session_total_tokens = 0
+
+        def __init__(self, session_id):
+            self.session_id = session_id
+
+        def run_conversation(self, **_kwargs):
+            from agent.runtime_cwd import resolve_session_file_root
+
+            barrier.wait(timeout=5)
+            observed[self.session_id] = str(resolve_session_file_root())
+            return {"final_response": "ok"}
+
+    monkeypatch.setattr(
+        adapter,
+        "_create_agent",
+        lambda **kwargs: RootObservingAgent(kwargs["session_id"]),
+    )
+
+    await asyncio.gather(
+        adapter._run_agent(
+            user_message="a",
+            conversation_history=[],
+            session_id="session-a",
+            session_root=str(roots["session-a"]),
+        ),
+        adapter._run_agent(
+            user_message="b",
+            conversation_history=[],
+            session_id="session-b",
+            session_root=str(roots["session-b"]),
+        ),
+    )
+
+    assert observed == {
+        session_id: str(root)
+        for session_id, root in roots.items()
+    }
+
+
+@pytest.mark.asyncio
+async def test_session_chat_passes_authenticated_session_root(
+    auth_adapter,
+    monkeypatch,
+    tmp_path,
+):
+    base = tmp_path / "workspace"
+    base.mkdir()
+    root = (
+        base
+        / "profiles"
+        / "00000000-0000-4000-8000-000000000200"
+        / "workspaces"
+        / "00000000-0000-4000-8000-000000000300"
+    )
+    monkeypatch.setattr(
+        "gateway.platforms.api_server._SESSION_ROOT_ALLOWED_BASE",
+        base,
+    )
+    app = _create_session_app(auth_adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        create = await cli.post(
+            "/api/sessions",
+            headers={"Authorization": "Bearer sk-test"},
+            json={"id": "root-chat-session", "title": "Root chat"},
+        )
+        assert create.status == 201
+
+        with patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as run_agent:
+            run_agent.return_value = (
+                {"final_response": "ok", "messages": [], "api_calls": 1},
+                {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            )
+            response = await cli.post(
+                "/api/sessions/root-chat-session/chat",
+                headers={
+                    "Authorization": "Bearer sk-test",
+                    "X-Hermes-Session-Root": str(root),
+                },
+                json={"input": "hello"},
+            )
+
+    assert response.status == 200
+    assert "X-Hermes-Session-Root" not in response.headers
+    assert run_agent.call_args.kwargs["session_root"] == str(root)
+
+
+@pytest.mark.asyncio
+async def test_session_chat_stream_passes_authenticated_session_root(
+    auth_adapter,
+    monkeypatch,
+    tmp_path,
+):
+    base = tmp_path / "workspace"
+    base.mkdir()
+    root = (
+        base
+        / "profiles"
+        / "00000000-0000-4000-8000-000000000200"
+        / "workspaces"
+        / "00000000-0000-4000-8000-000000000300"
+    )
+    monkeypatch.setattr(
+        "gateway.platforms.api_server._SESSION_ROOT_ALLOWED_BASE",
+        base,
+    )
+    app = _create_session_app(auth_adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        create = await cli.post(
+            "/api/sessions",
+            headers={"Authorization": "Bearer sk-test"},
+            json={"id": "root-stream-session", "title": "Root stream"},
+        )
+        assert create.status == 201
+
+        with patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as run_agent:
+            run_agent.return_value = (
+                {"final_response": "ok", "messages": [], "api_calls": 1},
+                {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            )
+            response = await cli.post(
+                "/api/sessions/root-stream-session/chat/stream",
+                headers={
+                    "Authorization": "Bearer sk-test",
+                    "X-Hermes-Session-Root": str(root),
+                },
+                json={"input": "hello"},
+            )
+            await response.read()
+
+    assert response.status == 200
+    assert "X-Hermes-Session-Root" not in response.headers
+    assert run_agent.call_args.kwargs["session_root"] == str(root)
 
 
 @pytest.mark.asyncio

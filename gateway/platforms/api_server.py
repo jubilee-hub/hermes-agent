@@ -2,12 +2,15 @@
 OpenAI-compatible API server platform adapter.
 
 Exposes an HTTP server with endpoints:
-- POST /v1/chat/completions        — OpenAI Chat Completions format (stateless; opt-in session continuity via X-Hermes-Session-Id header; opt-in long-term memory scoping via X-Hermes-Session-Key header)
-- POST /v1/responses               — OpenAI Responses API format (stateful via previous_response_id; X-Hermes-Session-Key supported)
+- POST /v1/chat/completions        — OpenAI Chat Completions format (stateless; opt-in session continuity, memory scoping, and authenticated file-root enforcement headers)
+- POST /v1/responses               — OpenAI Responses API format (stateful via previous_response_id; the same authenticated session headers are supported)
 - GET  /v1/responses/{response_id} — Retrieve a stored response
 - DELETE /v1/responses/{response_id} — Delete a stored response
 - GET  /v1/models                  — lists hermes-agent and any configured model_routes aliases
 - GET  /v1/capabilities            — machine-readable API capabilities for external UIs
+- POST /v1/session-root-canary     — authenticated Agent SaaS file-root enforcement probe
+- GET  /v1/workspace/files        — list regular files below the authenticated Session Root
+- GET  /v1/workspace/file         — read one regular file below the authenticated Session Root
 - GET  /api/sessions               — list client-visible Hermes sessions
 - POST /api/sessions               — create an empty Hermes session
 - GET/PATCH/DELETE /api/sessions/{session_id} — read/update/delete a session
@@ -51,10 +54,13 @@ import logging
 import os
 import re
 import sqlite3
+import shutil
+import stat
 import sys
+import tempfile
 import time
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Optional
 
 # Sentinel returned by _resolve_request_profile when a /p/<profile>/ prefix
@@ -125,6 +131,228 @@ MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversation
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+_SESSION_ROOT_CANARY_BASE = Path("/workspace")
+_SESSION_ROOT_ALLOWED_BASE = Path("/workspace")
+_SESSION_ROOT_DIRECTORY_MODE = 0o770
+_WORKSPACE_FILE_LIST_LIMIT = 4096
+_WORKSPACE_FILE_READ_LIMIT_BYTES = 32 * 1024 * 1024
+_WORKSPACE_RELATIVE_PATH_LIMIT = 4096
+_WORKSPACE_SCAN_ENTRY_LIMIT = 16384
+_WORKSPACE_DIRECTORY_DEPTH_LIMIT = 64
+_SESSION_ROOT_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+_SANDBOX_TASK_KEY_RE = re.compile(r"^sandbox-v1-[A-Za-z0-9_-]{43}$")
+
+
+class _InvalidManagedSessionRoot(ValueError):
+    """The requested Session Root is outside the managed workspace contract."""
+
+
+class _UnavailableManagedSessionRoot(OSError):
+    """The managed workspace mount cannot initialize the requested root."""
+
+
+def _managed_session_root_parts(root_path: Path) -> tuple[str, ...]:
+    """Return validated path components below the managed workspace mount.
+
+    Agent SaaS owns the only supported root layout. Keeping the shape narrow
+    prevents an authenticated internal caller from turning this header into a
+    general-purpose directory creation primitive.
+    """
+    base = _SESSION_ROOT_ALLOWED_BASE
+    if not base.is_absolute():
+        raise _UnavailableManagedSessionRoot("Session root base is unavailable")
+    try:
+        relative = root_path.relative_to(base)
+    except ValueError as exc:
+        raise _InvalidManagedSessionRoot("Session root is outside the managed base") from exc
+
+    parts = relative.parts
+    if (
+        len(parts) != 4
+        or parts[0] != "profiles"
+        or parts[2] != "workspaces"
+        or not _SESSION_ROOT_UUID_RE.fullmatch(parts[1])
+        or not _SESSION_ROOT_UUID_RE.fullmatch(parts[3])
+    ):
+        raise _InvalidManagedSessionRoot("Session root has an unmanaged layout")
+    return parts
+
+
+def _initialize_managed_session_root(root_path: Path) -> None:
+    """Create a validated Session Root without following symlink components.
+
+    Every lookup is anchored to an already-open directory descriptor. A
+    concurrent initializer may win any mkdir race; the losing request simply
+    opens the directory that now exists. Existing directories and files are
+    never removed, replaced, chmodded, or otherwise mutated.
+    """
+    parts = _managed_session_root_parts(root_path)
+    open_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    current_fd: Optional[int] = None
+    try:
+        current_fd = os.open(_SESSION_ROOT_ALLOWED_BASE, open_flags)
+        for part in parts:
+            try:
+                next_fd = os.open(part, open_flags, dir_fd=current_fd)
+            except FileNotFoundError:
+                try:
+                    os.mkdir(
+                        part,
+                        mode=_SESSION_ROOT_DIRECTORY_MODE,
+                        dir_fd=current_fd,
+                    )
+                except FileExistsError:
+                    # Another authenticated request initialized this exact
+                    # component after our failed open.
+                    pass
+                next_fd = os.open(part, open_flags, dir_fd=current_fd)
+            os.close(current_fd)
+            current_fd = next_fd
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise _InvalidManagedSessionRoot(
+                "Session root contains an invalid path component"
+            ) from exc
+        raise _UnavailableManagedSessionRoot(
+            "Session root could not be initialized"
+        ) from exc
+    finally:
+        if current_fd is not None:
+            os.close(current_fd)
+
+
+def _open_managed_session_root_fd(root_path: Path) -> int:
+    """Open a managed Session Root without following any path component."""
+    parts = _managed_session_root_parts(root_path)
+    open_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    current_fd: Optional[int] = None
+    try:
+        current_fd = os.open(_SESSION_ROOT_ALLOWED_BASE, open_flags)
+        for part in parts:
+            next_fd = os.open(part, open_flags, dir_fd=current_fd)
+            os.close(current_fd)
+            current_fd = next_fd
+        result = current_fd
+        current_fd = None
+        return result
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise PermissionError("Workspace path is unsafe") from exc
+        raise
+    finally:
+        if current_fd is not None:
+            os.close(current_fd)
+
+
+def _list_managed_workspace_files(root_path: Path) -> List[Dict[str, Any]]:
+    """List regular workspace files through descriptor-anchored traversal."""
+    root_fd = _open_managed_session_root_fd(root_path)
+    rows: List[Dict[str, Any]] = []
+    scanned_entries = 0
+
+    def walk(directory_fd: int, prefix: tuple[str, ...], depth: int) -> None:
+        nonlocal scanned_entries
+        if depth > _WORKSPACE_DIRECTORY_DEPTH_LIMIT:
+            raise OverflowError("Workspace directory tree is too deep")
+        with os.scandir(directory_fd) as entries:
+            for entry in entries:
+                scanned_entries += 1
+                if scanned_entries > _WORKSPACE_SCAN_ENTRY_LIMIT:
+                    raise OverflowError("Workspace contains too many entries")
+                name = entry.name
+                try:
+                    metadata = entry.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                relative = "/".join((*prefix, name))
+                if stat.S_ISLNK(metadata.st_mode):
+                    continue
+                if stat.S_ISDIR(metadata.st_mode):
+                    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                    try:
+                        child_fd = os.open(name, flags, dir_fd=directory_fd)
+                    except FileNotFoundError:
+                        continue
+                    except OSError as exc:
+                        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                            raise PermissionError("Workspace path is unsafe") from exc
+                        raise
+                    try:
+                        walk(child_fd, (*prefix, name), depth + 1)
+                    finally:
+                        os.close(child_fd)
+                    continue
+                if stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1:
+                    try:
+                        _parse_workspace_relative_path(relative)
+                    except ValueError as exc:
+                        raise PermissionError("Workspace path is unsafe") from exc
+                    rows.append({"path": relative, "sizeBytes": metadata.st_size})
+                    if len(rows) > _WORKSPACE_FILE_LIST_LIMIT:
+                        raise OverflowError("Workspace contains too many files")
+
+    try:
+        walk(root_fd, (), 0)
+    finally:
+        os.close(root_fd)
+    return sorted(rows, key=lambda row: row["path"])
+
+
+def _parse_workspace_relative_path(raw: str) -> tuple[str, ...]:
+    if not raw or len(raw) > _WORKSPACE_RELATIVE_PATH_LIMIT:
+        raise ValueError("Workspace file path is invalid")
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in raw):
+        raise ValueError("Workspace file path is invalid")
+    parsed = PurePosixPath(raw)
+    if parsed.is_absolute() or ".." in parsed.parts or raw != str(parsed):
+        raise ValueError("Workspace file path is invalid")
+    if not parsed.parts:
+        raise ValueError("Workspace file path is invalid")
+    return parsed.parts
+
+
+def _read_managed_workspace_file(root_path: Path, relative_path: str) -> bytes:
+    """Read one regular file through descriptor-anchored traversal."""
+    parts = _parse_workspace_relative_path(relative_path)
+    current_fd = _open_managed_session_root_fd(root_path)
+    file_fd: Optional[int] = None
+    try:
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        for part in parts[:-1]:
+            next_fd = os.open(part, directory_flags, dir_fd=current_fd)
+            os.close(current_fd)
+            current_fd = next_fd
+        file_fd = os.open(
+            parts[-1],
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=current_fd,
+        )
+        metadata = os.fstat(file_fd)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise PermissionError("Workspace file is unsafe")
+        if metadata.st_size > _WORKSPACE_FILE_READ_LIMIT_BYTES:
+            raise OverflowError("Workspace file is too large")
+        chunks: List[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(file_fd, 1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > _WORKSPACE_FILE_READ_LIMIT_BYTES:
+                raise OverflowError("Workspace file is too large")
+            chunks.append(chunk)
+        return b"".join(chunks)
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise PermissionError("Workspace path is unsafe") from exc
+        raise
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+        os.close(current_fd)
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -710,6 +938,24 @@ def _admit_api_agent_request(handler):
         draining = self._draining_response()
         if draining is not None:
             return draining
+        sandbox_task_key, sandbox_err = self._parse_sandbox_task_key_header(
+            request
+        )
+        if sandbox_err is not None:
+            return sandbox_err
+        if (
+            sandbox_task_key
+            and handler.__name__
+            not in {"_handle_chat_completions", "_handle_responses"}
+        ):
+            return web.json_response(
+                _openai_error(
+                    "This endpoint cannot safely execute a sandbox-scoped turn.",
+                    code="sandbox_endpoint_unsupported",
+                ),
+                status=503,
+            )
+        request["hermes_sandbox_task_key"] = sandbox_task_key
         reservation = {"active": True}
         token = _api_agent_request_reservation.set(reservation)
         self._pending_agent_requests += 1
@@ -843,9 +1089,30 @@ class _IdempotencyCache:
 _idem_cache = _IdempotencyCache()
 
 
-def _make_request_fingerprint(body: Dict[str, Any], keys: List[str]) -> str:
+def _session_root_file_ops_supported() -> bool:
+    """Whether this runtime can enforce descriptor-anchored Session Roots."""
+    required_dir_fd = (os.open, os.mkdir, os.stat, os.unlink)
+    return (
+        os.name == "posix"
+        and bool(getattr(os, "O_NOFOLLOW", 0))
+        and bool(getattr(os, "O_NONBLOCK", 0))
+        and all(operation in os.supports_dir_fd for operation in required_dir_fd)
+        and os.listdir in os.supports_fd
+        and os.scandir in os.supports_fd
+    )
+
+
+def _make_request_fingerprint(
+    body: Dict[str, Any],
+    keys: List[str],
+    *,
+    execution_context: Optional[Dict[str, Any]] = None,
+) -> str:
     from hashlib import sha256
-    subset = {k: body.get(k) for k in keys}
+    subset = {
+        "body": {k: body.get(k) for k in keys},
+        "execution_context": execution_context or {},
+    }
     return sha256(repr(subset).encode("utf-8")).hexdigest()
 
 
@@ -946,6 +1213,10 @@ class APIServerAdapter(BasePlatformAdapter):
             raw_port = os.getenv("API_SERVER_PORT", str(DEFAULT_PORT))
         self._port: int = _coerce_port(raw_port, DEFAULT_PORT)
         self._api_key: str = extra.get("key", os.getenv("API_SERVER_KEY", ""))
+        self._sandbox_task_key_required: bool = _coerce_request_bool(
+            extra.get("sandbox_task_key_required"),
+            default=False,
+        )
         self._cors_origins: tuple[str, ...] = self._parse_cors_origins(
             extra.get("cors_origins", os.getenv("API_SERVER_CORS_ORIGINS", "")),
         )
@@ -1484,6 +1755,9 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/health", self._handle_health),
             ("GET", "/v1/models", self._handle_models),
             ("GET", "/v1/capabilities", self._handle_capabilities),
+            ("POST", "/v1/session-root-canary", self._handle_session_root_canary),
+            ("GET", "/v1/workspace/files", self._handle_workspace_files),
+            ("GET", "/v1/workspace/file", self._handle_workspace_file),
             ("GET", "/v1/skills", self._handle_skills),
             ("GET", "/v1/toolsets", self._handle_toolsets),
             ("GET", "/api/sessions", self._handle_list_sessions),
@@ -1535,6 +1809,7 @@ class APIServerAdapter(BasePlatformAdapter):
     # (e.g. ``agent:main:webui:dm:user-42``) while staying small enough
     # that the sanitized form is safe to pass into Honcho / state.db.
     _MAX_SESSION_HEADER_LEN = 256
+    _MAX_SESSION_ROOT_HEADER_LEN = 1024
 
     def _parse_session_key_header(
         self, request: "web.Request"
@@ -1587,6 +1862,198 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         return raw, None
+
+    def _parse_sandbox_task_key_header(
+        self,
+        request: "web.Request",
+    ) -> tuple[Optional[str], Optional["web.Response"]]:
+        """Validate the internal execution identity without echoing it.
+
+        The identity is accepted only on API-key-authenticated server-to-server
+        requests. It remains independent from the transcript/session identity.
+        """
+        raw = request.headers.get("X-Hermes-Sandbox-Task-Key", "").strip()
+        if not raw:
+            if self._sandbox_task_key_required:
+                return None, web.json_response(
+                    _openai_error(
+                        "Sandbox task identity is required.",
+                        code="sandbox_task_key_required",
+                    ),
+                    status=400,
+                )
+            return None, None
+
+        if not self._api_key:
+            return None, web.json_response(
+                _openai_error(
+                    "Sandbox task identity requires API key authentication.",
+                    code="sandbox_task_key_requires_auth",
+                ),
+                status=403,
+            )
+        if not _SANDBOX_TASK_KEY_RE.fullmatch(raw):
+            return None, web.json_response(
+                _openai_error(
+                    "Invalid sandbox task identity.",
+                    code="invalid_sandbox_task_key",
+                ),
+                status=400,
+            )
+
+        try:
+            from gateway.run import _load_gateway_config
+            from hermes_cli.tools_config import _get_platform_tools
+
+            enabled = _get_platform_tools(
+                _load_gateway_config(),
+                "api_server",
+            )
+        except Exception:
+            logger.exception(
+                "Could not verify tool policy for sandbox execution request"
+            )
+            return None, web.json_response(
+                _openai_error(
+                    "Sandbox execution policy is unavailable.",
+                    code="sandbox_policy_unavailable",
+                ),
+                status=503,
+            )
+        if "delegation" in enabled:
+            return None, web.json_response(
+                _openai_error(
+                    "Delegation is unavailable for sandbox execution.",
+                    code="sandbox_delegation_unsupported",
+                ),
+                status=503,
+            )
+        return raw, None
+
+    @staticmethod
+    def _sandbox_context_hash(sandbox_task_key: Optional[str]) -> Optional[str]:
+        if not sandbox_task_key:
+            return None
+        return "sha256:" + hashlib.sha256(
+            sandbox_task_key.encode("utf-8")
+        ).hexdigest()
+
+    @staticmethod
+    def _sandbox_execution_task_id(
+        sandbox_task_key: Optional[str],
+    ) -> Optional[str]:
+        """Return a non-secret task id suitable for logs and registries."""
+        if not sandbox_task_key:
+            return None
+        return "sandbox-task-" + hashlib.sha256(
+            sandbox_task_key.encode("utf-8")
+        ).hexdigest()
+
+    async def _bind_sandbox_session_context(
+        self,
+        session_id: str,
+        sandbox_context_hash: Optional[str],
+    ) -> Optional["web.Response"]:
+        """Fail closed if a transcript is reused by another sandbox."""
+        if not sandbox_context_hash:
+            return None
+        try:
+            db = await self._ensure_session_db_async()
+            if db is None:
+                raise RuntimeError("session database unavailable")
+            accepted = await asyncio.to_thread(
+                db.bind_sandbox_context,
+                session_id,
+                sandbox_context_hash,
+            )
+        except Exception:
+            logger.exception("Could not bind sandbox context to API session")
+            return web.json_response(
+                _openai_error(
+                    "Sandbox session context is unavailable.",
+                    code="sandbox_task_context_unavailable",
+                ),
+                status=503,
+            )
+        if not accepted:
+            return web.json_response(
+                _openai_error(
+                    "Session belongs to a different sandbox context.",
+                    code="sandbox_task_context_mismatch",
+                ),
+                status=409,
+            )
+        return None
+
+    def _parse_session_root_header(
+        self, request: "web.Request"
+    ) -> tuple[Optional[str], Optional["web.Response"]]:
+        """Extract and validate the internal ``X-Hermes-Session-Root`` header.
+
+        The trusted control plane uses this request-scoped root to constrain
+        file tools.  The value is never echoed to clients.
+        """
+        raw = request.headers.get("X-Hermes-Session-Root", "")
+        if not raw:
+            return None, None
+
+        if not self._api_key:
+            return None, web.json_response(
+                _openai_error(
+                    "X-Hermes-Session-Root requires API key authentication. "
+                    "Configure API_SERVER_KEY to enable this feature."
+                ),
+                status=403,
+            )
+
+        if not _session_root_file_ops_supported():
+            return None, web.json_response(
+                _openai_error(
+                    "X-Hermes-Session-Root is not supported on this runtime"
+                ),
+                status=501,
+            )
+
+        if any(ord(char) < 0x20 or ord(char) == 0x7F for char in raw):
+            return None, web.json_response(
+                _openai_error("Invalid session root"),
+                status=400,
+            )
+        if len(raw) > self._MAX_SESSION_ROOT_HEADER_LEN:
+            return None, web.json_response(
+                _openai_error("Session root too long"),
+                status=400,
+            )
+        root_path = Path(raw)
+        if not root_path.is_absolute():
+            return None, web.json_response(
+                _openai_error("Session root must be absolute"),
+                status=400,
+            )
+        if ".." in root_path.parts:
+            return None, web.json_response(
+                _openai_error("Session root must not contain '..' traversal"),
+                status=400,
+            )
+        if raw != str(root_path):
+            return None, web.json_response(
+                _openai_error("Session root must use a canonical path"),
+                status=400,
+            )
+
+        try:
+            _initialize_managed_session_root(root_path)
+        except _InvalidManagedSessionRoot:
+            return None, web.json_response(
+                _openai_error("Invalid managed session root"),
+                status=400,
+            )
+        except _UnavailableManagedSessionRoot:
+            return None, web.json_response(
+                _openai_error("Managed session root is unavailable"),
+                status=503,
+            )
+        return str(root_path), None
 
     # ------------------------------------------------------------------
     # Session DB helper
@@ -1880,8 +2347,26 @@ class APIServerAdapter(BasePlatformAdapter):
     # HTTP Handlers
     # ------------------------------------------------------------------
 
+    async def _sandbox_runner_ready(self) -> bool:
+        if not self._sandbox_task_key_required:
+            return True
+        from tools.environments.sandbox_runner import (
+            sandbox_runner_ready_from_environment,
+        )
+
+        return await asyncio.to_thread(sandbox_runner_ready_from_environment)
+
     async def _handle_health(self, request: "web.Request") -> "web.Response":
         """GET /health — simple health check."""
+        if not await self._sandbox_runner_ready():
+            return web.json_response(
+                {
+                    "status": "not_ready",
+                    "platform": "hermes-agent",
+                    "version": _hermes_version(),
+                },
+                status=503,
+            )
         return web.json_response(
             {"status": "ok", "platform": "hermes-agent", "version": _hermes_version()}
         )
@@ -1920,6 +2405,20 @@ class APIServerAdapter(BasePlatformAdapter):
             process_completion_queue_depth=process_depth,
             active_delegations=active_delegations,
         )
+        if self._sandbox_task_key_required:
+            checks = dict(readiness.get("checks", {}))
+            checks["sandbox_runner"] = {
+                "status": "ok" if await self._sandbox_runner_ready() else "degraded"
+            }
+            readiness = {
+                **readiness,
+                "status": (
+                    "ok"
+                    if all(item.get("status") == "ok" for item in checks.values())
+                    else "degraded"
+                ),
+                "checks": checks,
+            }
         return web.json_response({
             "status": readiness["status"],
             "readiness": readiness,
@@ -1990,6 +2489,189 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return web.json_response({"object": "list", "data": models})
 
+    async def _handle_session_root_canary(
+        self,
+        request: "web.Request",
+    ) -> "web.Response":
+        """Exercise the real file tools against an isolated throwaway root.
+
+        Agent SaaS uses this API-key-protected endpoint as runtime evidence
+        that Session Root enforcement is active. The caller cannot choose a
+        path, and every probe uses unique private directories under the
+        mounted workspace so overlapping checks cannot share files.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        root: Optional[Path] = None
+        outside: Optional[Path] = None
+        relative_escape: Optional[Path] = None
+        session_root_bound = False
+        try:
+            from agent.runtime_cwd import (
+                clear_session_file_root,
+                set_session_file_root,
+            )
+            from tools.file_tools import (
+                read_file_tool,
+                search_tool,
+                write_file_tool,
+            )
+
+            root = Path(tempfile.mkdtemp(
+                prefix=".agent-saas-canary-root-",
+                dir=_SESSION_ROOT_CANARY_BASE,
+            ))
+            outside = Path(tempfile.mkdtemp(
+                prefix=".agent-saas-canary-outside-",
+                dir=_SESSION_ROOT_CANARY_BASE,
+            ))
+            relative_escape = root.parent / f"{root.name}-relative-escape.md"
+            marker = f"canary-{uuid.uuid4().hex}"
+            task_id = "agent-saas-session-root-canary"
+
+            def _parse_tool_result(value: str) -> Dict[str, Any]:
+                try:
+                    parsed = json.loads(value)
+                except (TypeError, ValueError):
+                    return {"error": "invalid tool result"}
+                return parsed if isinstance(parsed, dict) else {"error": "invalid tool result"}
+
+            def _denied(value: str, target: Path) -> bool:
+                parsed = _parse_tool_result(value)
+                return bool(parsed.get("error")) and not target.exists()
+
+            set_session_file_root(str(root))
+            session_root_bound = True
+
+            inside = root / "inside.md"
+            written = _parse_tool_result(
+                write_file_tool(
+                    "inside.md",
+                    f"{marker}\n",
+                    task_id=task_id,
+                )
+            )
+            read_back = _parse_tool_result(
+                read_file_tool("inside.md", task_id=task_id)
+            )
+            checks: Dict[str, bool] = {
+                "allowedWriteInsideRoot": (
+                    not written.get("error") and inside.is_file()
+                ),
+                "allowedReadInsideRoot": (
+                    not read_back.get("error")
+                    and marker in json.dumps(read_back, ensure_ascii=False)
+                ),
+                "relativeEscapeDenied": _denied(
+                    write_file_tool(
+                        f"../{relative_escape.name}",
+                        "x\n",
+                        task_id=task_id,
+                    ),
+                    relative_escape,
+                ),
+                "absoluteEscapeDenied": _denied(
+                    write_file_tool(
+                        str(outside / "absolute-escape.md"),
+                        "x\n",
+                        task_id=task_id,
+                    ),
+                    outside / "absolute-escape.md",
+                ),
+            }
+
+            symlink_created = False
+            try:
+                (root / "link").symlink_to(outside, target_is_directory=True)
+                symlink_created = True
+            except OSError:
+                pass
+            checks["symlinkEscapeDenied"] = symlink_created and _denied(
+                write_file_tool(
+                    "link/symlink-escape.md",
+                    "x\n",
+                    task_id=task_id,
+                ),
+                outside / "symlink-escape.md",
+            )
+            baseline_search = _parse_tool_result(
+                search_tool(
+                    marker,
+                    path=".",
+                    task_id=task_id,
+                )
+            )
+            serialized_baseline = json.dumps(
+                baseline_search,
+                ensure_ascii=False,
+            )
+            baseline_search_works = (
+                not baseline_search.get("error")
+                and marker in serialized_baseline
+            )
+            outside_marker = f"{marker}-outside"
+            (outside / "search-leak.md").write_text(
+                f"{outside_marker}\n",
+                encoding="utf-8",
+            )
+            search_result = _parse_tool_result(
+                search_tool(
+                    marker,
+                    path=".",
+                    task_id=task_id,
+                )
+            )
+            serialized_search = json.dumps(search_result, ensure_ascii=False)
+            # Both safe implementations are accepted: reject the whole tree,
+            # or search the real inside file while skipping the escaping link.
+            checks["searchTreeEscapeDenied"] = (
+                symlink_created
+                and baseline_search_works
+                and (
+                    bool(search_result.get("error"))
+                    or (
+                        marker in serialized_search
+                        and outside_marker not in serialized_search
+                    )
+                )
+            )
+
+            required = (
+                "allowedWriteInsideRoot",
+                "allowedReadInsideRoot",
+                "relativeEscapeDenied",
+                "absoluteEscapeDenied",
+                "symlinkEscapeDenied",
+                "searchTreeEscapeDenied",
+            )
+            return web.json_response({
+                "object": "hermes.session_root_canary",
+                "enforced": all(checks.get(name) is True for name in required),
+                "checks": checks,
+            })
+        except Exception:
+            logger.exception("Session Root canary failed")
+            return web.json_response(
+                {"error": "session_root_canary_failed"},
+                status=500,
+            )
+        finally:
+            try:
+                if session_root_bound:
+                    clear_session_file_root()
+            finally:
+                if root is not None:
+                    shutil.rmtree(root, ignore_errors=True)
+                if outside is not None:
+                    shutil.rmtree(outside, ignore_errors=True)
+                if relative_escape is not None:
+                    try:
+                        relative_escape.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+
     async def _handle_capabilities(self, request: "web.Request") -> "web.Response":
         """GET /v1/capabilities — advertise the stable API surface.
 
@@ -2000,6 +2682,16 @@ class APIServerAdapter(BasePlatformAdapter):
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
+        if not await self._sandbox_runner_ready():
+            return web.json_response(
+                _openai_error(
+                    "Sandbox execution runtime is not ready.",
+                    code="sandbox_runner_not_ready",
+                ),
+                status=503,
+            )
+
+        workspace_files_supported = _session_root_file_ops_supported()
 
         return web.json_response({
             "object": "hermes.api_server.capabilities",
@@ -2010,13 +2702,24 @@ class APIServerAdapter(BasePlatformAdapter):
                 "required": bool(self._api_key),
             },
             "runtime": {
-                "mode": "server_agent",
-                "tool_execution": "server",
-                "split_runtime": False,
+                "mode": (
+                    "controlled_sandbox"
+                    if self._sandbox_task_key_required
+                    else "server_agent"
+                ),
+                "tool_execution": (
+                    "sandbox_runner_required"
+                    if self._sandbox_task_key_required
+                    else "server"
+                ),
+                "split_runtime": self._sandbox_task_key_required,
                 "description": (
+                    "Agent turns require a control-plane sandbox identity and "
+                    "execution is routed to the sandbox Runner."
+                    if self._sandbox_task_key_required
+                    else
                     "The API server creates a server-side Hermes AIAgent; "
-                    "tools execute on the API-server host unless a future "
-                    "explicit split-runtime mode is enabled."
+                    "tools execute on the API-server host."
                 ),
             },
             "features": {
@@ -2024,7 +2727,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "chat_completions_streaming": True,
                 "responses_api": True,
                 "responses_streaming": True,
-                "run_submission": True,
+                "run_submission": not self._sandbox_task_key_required,
                 "run_status": True,
                 "run_events_sse": True,
                 "run_stop": True,
@@ -2032,8 +2735,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "tool_progress_events": True,
                 "approval_events": True,
                 "session_resources": True,
-                "session_chat": True,
-                "session_chat_streaming": True,
+                "session_chat": not self._sandbox_task_key_required,
+                "session_chat_streaming": not self._sandbox_task_key_required,
                 "session_fork": True,
                 "admin_config_rw": False,
                 "jobs_admin": False,
@@ -2043,6 +2746,17 @@ class APIServerAdapter(BasePlatformAdapter):
                 "realtime_voice": False,
                 "session_continuity_header": "X-Hermes-Session-Id",
                 "session_key_header": "X-Hermes-Session-Key",
+                "sandbox_task_key_header": "X-Hermes-Sandbox-Task-Key",
+                "sandbox_task_key_required": self._sandbox_task_key_required,
+                "sandbox_task_supported_endpoints": [
+                    "/v1/chat/completions",
+                    "/v1/responses",
+                ],
+                "session_root_header": (
+                    "X-Hermes-Session-Root"
+                    if workspace_files_supported
+                    else False
+                ),
                 "cors": bool(self._cors_origins),
             },
             "endpoints": {
@@ -2058,6 +2772,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
                 "skills": {"method": "GET", "path": "/v1/skills"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
+                **(
+                    {
+                        "workspace_files": {"method": "GET", "path": "/v1/workspace/files"},
+                        "workspace_file": {"method": "GET", "path": "/v1/workspace/file"},
+                    }
+                    if workspace_files_supported
+                    else {}
+                ),
                 "sessions": {"method": "GET", "path": "/api/sessions"},
                 "session_create": {"method": "POST", "path": "/api/sessions"},
                 "session": {"method": "GET", "path": "/api/sessions/{session_id}"},
@@ -2069,6 +2791,90 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
             },
         })
+
+    async def _handle_workspace_files(self, request: "web.Request") -> "web.Response":
+        """GET /v1/workspace/files — list safe files below the authenticated root."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        root, root_err = self._parse_session_root_header(request)
+        if root_err:
+            return root_err
+        if root is None:
+            return web.json_response(
+                _openai_error("X-Hermes-Session-Root is required"),
+                status=400,
+            )
+        try:
+            data = await asyncio.to_thread(_list_managed_workspace_files, Path(root))
+        except PermissionError:
+            return web.json_response(
+                _openai_error("Workspace contains an unsafe path"),
+                status=403,
+            )
+        except OverflowError:
+            return web.json_response(
+                _openai_error("Workspace contains too many entries"),
+                status=413,
+            )
+        except OSError:
+            logger.exception("GET /v1/workspace/files failed")
+            return web.json_response(
+                _openai_error("Failed to enumerate workspace files", err_type="server_error"),
+                status=500,
+            )
+        return web.json_response({"data": data})
+
+    async def _handle_workspace_file(self, request: "web.Request") -> "web.Response":
+        """GET /v1/workspace/file — read one safe file below the authenticated root."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        root, root_err = self._parse_session_root_header(request)
+        if root_err:
+            return root_err
+        if root is None:
+            return web.json_response(
+                _openai_error("X-Hermes-Session-Root is required"),
+                status=400,
+            )
+        try:
+            body = await asyncio.to_thread(
+                _read_managed_workspace_file,
+                Path(root),
+                request.query.get("path", ""),
+            )
+        except ValueError:
+            return web.json_response(
+                _openai_error("Invalid workspace file path"),
+                status=400,
+            )
+        except FileNotFoundError:
+            return web.json_response(
+                _openai_error("Workspace file was not found"),
+                status=404,
+            )
+        except PermissionError:
+            return web.json_response(
+                _openai_error("Workspace file path is unsafe"),
+                status=403,
+            )
+        except OverflowError:
+            return web.json_response(
+                _openai_error("Workspace file is too large"),
+                status=413,
+            )
+        except OSError:
+            logger.exception("GET /v1/workspace/file failed")
+            return web.json_response(
+                _openai_error("Failed to read workspace file", err_type="server_error"),
+                status=500,
+            )
+        return web.Response(
+            body=body,
+            content_type="application/octet-stream",
+            headers={"X-Content-Type-Options": "nosniff"},
+        )
 
     async def _handle_skills(self, request: "web.Request") -> "web.Response":
         """GET /v1/skills — list installed skills visible to the API-server agent.
@@ -2472,6 +3278,9 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
+        session_root, root_err = self._parse_session_root_header(request)
+        if root_err is not None:
+            return root_err
         session_id = request.match_info["session_id"]
         _, err = await self._get_existing_session_or_404(session_id)
         if err:
@@ -2492,6 +3301,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ephemeral_system_prompt=system_prompt,
             session_id=session_id,
             gateway_session_key=gateway_session_key,
+            session_root=session_root,
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
         final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
@@ -2514,6 +3324,9 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
+        session_root, root_err = self._parse_session_root_header(request)
+        if root_err is not None:
+            return root_err
         session_id = request.match_info["session_id"]
         _, err = await self._get_existing_session_or_404(session_id)
         if err:
@@ -2581,6 +3394,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     stream_delta_callback=_delta,
                     tool_progress_callback=_tool_progress,
                     gateway_session_key=gateway_session_key,
+                    session_root=session_root,
                 )
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
@@ -2713,6 +3527,11 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
+        session_root, root_err = self._parse_session_root_header(request)
+        if root_err is not None:
+            return root_err
+        sandbox_task_key = request.get("hermes_sandbox_task_key")
+        sandbox_context_hash = self._sandbox_context_hash(sandbox_task_key)
 
         # Allow caller to continue an existing session by passing X-Hermes-Session-Id.
         # When provided, history is loaded from state.db instead of from the request body.
@@ -2753,13 +3572,6 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=400,
                 )
             session_id = provided_session_id
-            try:
-                db = await self._ensure_session_db_async()
-                if db is not None:
-                    history = await asyncio.to_thread(db.get_messages_as_conversation, session_id)
-            except Exception as e:
-                logger.warning("Failed to load session history for %s: %s", session_id, e)
-                history = []
         else:
             # Derive a stable session ID from the conversation fingerprint so
             # that consecutive messages from the same Open WebUI (or similar)
@@ -2772,6 +3584,29 @@ class APIServerAdapter(BasePlatformAdapter):
                     break
             session_id = _derive_chat_session_id(system_prompt, first_user)
             # history already set from request body above
+
+        sandbox_bind_err = await self._bind_sandbox_session_context(
+            session_id,
+            sandbox_context_hash,
+        )
+        if sandbox_bind_err is not None:
+            return sandbox_bind_err
+
+        if provided_session_id:
+            try:
+                db = await self._ensure_session_db_async()
+                if db is not None:
+                    history = await asyncio.to_thread(
+                        db.get_messages_as_conversation,
+                        session_id,
+                    )
+            except Exception as e:
+                logger.warning(
+                    "Failed to load session history for %s: %s",
+                    session_id,
+                    e,
+                )
+                history = []
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", self._model_name)
@@ -2864,6 +3699,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                session_root=session_root,
+                sandbox_task_key=sandbox_task_key,
                 route=route,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
@@ -2884,12 +3721,24 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                session_root=session_root,
+                sandbox_task_key=sandbox_task_key,
                 route=route,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
         if idempotency_key:
-            fp = _make_request_fingerprint(body, keys=["model", "messages", "tools", "tool_choice", "stream"])
+            fp = _make_request_fingerprint(
+                body,
+                keys=["model", "messages", "tools", "tool_choice", "stream"],
+                execution_context={
+                    "endpoint": "chat.completions",
+                    "session_id": session_id,
+                    "session_key": gateway_session_key,
+                    "session_root": session_root,
+                    "sandbox_context": sandbox_context_hash,
+                },
+            )
             try:
                 result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_completion)
             except Exception as e:
@@ -3200,6 +4049,7 @@ class APIServerAdapter(BasePlatformAdapter):
         store: bool,
         session_id: str,
         gateway_session_key: Optional[str] = None,
+        sandbox_context_hash: Optional[str] = None,
     ) -> "web.StreamResponse":
         """Write an SSE stream for POST /v1/responses (OpenAI Responses API).
 
@@ -3308,6 +4158,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "conversation_history": conversation_history_snapshot,
                 "instructions": instructions,
                 "session_id": session_id,
+                "sandbox_context_hash": sandbox_context_hash,
             })
             if conversation:
                 self._response_store.set_conversation(conversation, response_id)
@@ -3792,6 +4643,11 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
+        session_root, root_err = self._parse_session_root_header(request)
+        if root_err is not None:
+            return root_err
+        sandbox_task_key = request.get("hermes_sandbox_task_key")
+        sandbox_context_hash = self._sandbox_context_hash(sandbox_task_key)
 
         # Parse request body
         try:
@@ -3865,6 +4721,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 logger.debug("Both conversation_history and previous_response_id provided; using conversation_history")
 
         stored_session_id = None
+        stored = None
         if not conversation_history and previous_response_id:
             stored = self._response_store.get(previous_response_id)
             if stored is None:
@@ -3874,6 +4731,27 @@ class APIServerAdapter(BasePlatformAdapter):
             # If no instructions provided, carry forward from previous
             if instructions is None:
                 instructions = stored.get("instructions")
+        elif previous_response_id:
+            stored = self._response_store.get(previous_response_id)
+            if stored is None:
+                return web.json_response(
+                    _openai_error(
+                        f"Previous response not found: {previous_response_id}"
+                    ),
+                    status=404,
+                )
+
+        if (
+            stored is not None
+            and stored.get("sandbox_context_hash") != sandbox_context_hash
+        ):
+            return web.json_response(
+                _openai_error(
+                    "Previous response belongs to a different sandbox context.",
+                    code="sandbox_task_context_mismatch",
+                ),
+                status=409,
+            )
 
         # Append new input messages to history (all but the last become history)
         for msg in input_messages[:-1]:
@@ -3891,6 +4769,12 @@ class APIServerAdapter(BasePlatformAdapter):
         # Reuse session from previous_response_id chain so the dashboard
         # groups the entire conversation under one session entry.
         session_id = stored_session_id or str(uuid.uuid4())
+        sandbox_bind_err = await self._bind_sandbox_session_context(
+            session_id,
+            sandbox_context_hash,
+        )
+        if sandbox_bind_err is not None:
+            return sandbox_bind_err
 
         # Per-client model routing for /v1/responses (see model_routes).
         route = self._resolve_route(body.get("model"))
@@ -3948,6 +4832,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                session_root=session_root,
+                sandbox_task_key=sandbox_task_key,
                 route=route,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
@@ -3973,6 +4859,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 store=store,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                sandbox_context_hash=sandbox_context_hash,
             )
 
         async def _compute_response():
@@ -3982,6 +4869,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                session_root=session_root,
+                sandbox_task_key=sandbox_task_key,
                 route=route,
             )
 
@@ -3990,6 +4879,12 @@ class APIServerAdapter(BasePlatformAdapter):
             fp = _make_request_fingerprint(
                 body,
                 keys=["input", "instructions", "previous_response_id", "conversation", "model", "tools"],
+                execution_context={
+                    "endpoint": "responses",
+                    "session_key": gateway_session_key,
+                    "session_root": session_root,
+                    "sandbox_context": sandbox_context_hash,
+                },
             )
             try:
                 result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_response)
@@ -4056,6 +4951,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "conversation_history": full_history,
                 "instructions": instructions,
                 "session_id": session_id,
+                "sandbox_context_hash": sandbox_context_hash,
             })
             # Update conversation mapping so the next request with the same
             # conversation name automatically chains to this response
@@ -4593,6 +5489,7 @@ class APIServerAdapter(BasePlatformAdapter):
         chat_id: str = "",
         session_key: str = "",
         session_id: str = "",
+        session_root: str = "",
     ) -> list:
         """Bind session contextvars for an API-server agent run.
 
@@ -4616,6 +5513,8 @@ class APIServerAdapter(BasePlatformAdapter):
             chat_id=chat_id,
             session_key=session_key,
             session_id=session_id,
+            cwd=session_root,
+            file_root=session_root,
             async_delivery=False,
         )
 
@@ -4631,6 +5530,8 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_complete_callback=None,
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
+        session_root: Optional[str] = None,
+        sandbox_task_key: Optional[str] = None,
         route: Optional[Dict[str, Any]] = None,
     ) -> tuple:
         """
@@ -4653,47 +5554,101 @@ class APIServerAdapter(BasePlatformAdapter):
         # run_in_executor threads, so the profile scope must be re-entered
         # inside _run() from this explicit value.
         request_profile = _api_request_profile.get()
+        sandbox_context_hash = self._sandbox_context_hash(sandbox_task_key)
+        sandbox_execution_task_id = self._sandbox_execution_task_id(
+            sandbox_task_key
+        )
 
         def _run():
             from gateway.session_context import clear_session_vars
+            from tools.terminal_tool import scoped_task_env_overrides
 
             with self._profile_scope(request_profile):
                 tokens = self._bind_api_server_session(
                     chat_id=session_id or "",
                     session_key=gateway_session_key or session_id or "",
                     session_id=session_id or "",
+                    session_root=session_root or "",
                 )
                 try:
-                    agent = self._create_agent(
-                        ephemeral_system_prompt=ephemeral_system_prompt,
-                        session_id=session_id,
-                        stream_delta_callback=stream_delta_callback,
-                        tool_progress_callback=tool_progress_callback,
-                        tool_start_callback=tool_start_callback,
-                        tool_complete_callback=tool_complete_callback,
-                        gateway_session_key=gateway_session_key,
-                        route=route,
+                    if sandbox_context_hash:
+                        db = self._ensure_session_db()
+                        if (
+                            db is None
+                            or not db.bind_sandbox_context(
+                                session_id or "",
+                                sandbox_context_hash,
+                            )
+                        ):
+                            raise RuntimeError(
+                                "Sandbox session context is unavailable"
+                            )
+
+                    override_scope = (
+                        scoped_task_env_overrides(
+                            sandbox_execution_task_id,
+                            {
+                                "env_type": "sandbox_runner",
+                                "sandbox_task_key": sandbox_task_key,
+                            },
+                        )
+                        if sandbox_execution_task_id
+                        else nullcontext()
                     )
-                    if agent_ref is not None:
-                        agent_ref[0] = agent
-                    effective_task_id = session_id or str(uuid.uuid4())
-                    result = agent.run_conversation(
-                        user_message=user_message,
-                        conversation_history=conversation_history,
-                        task_id=effective_task_id,
-                    )
-                    usage = {
-                        "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
-                        "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
-                        "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
-                    }
-                    # Include the effective session ID in the result so callers
-                    # (e.g. X-Hermes-Session-Id header) can track compression-
-                    # triggered session rotations. (#16938)
-                    _eff_sid = getattr(agent, "session_id", session_id)
-                    if isinstance(_eff_sid, str) and _eff_sid:
-                        result["session_id"] = _eff_sid
-                    return result, usage
+                    with override_scope:
+                        agent = self._create_agent(
+                            ephemeral_system_prompt=ephemeral_system_prompt,
+                            session_id=session_id,
+                            stream_delta_callback=stream_delta_callback,
+                            tool_progress_callback=tool_progress_callback,
+                            tool_start_callback=tool_start_callback,
+                            tool_complete_callback=tool_complete_callback,
+                            gateway_session_key=gateway_session_key,
+                            route=route,
+                        )
+                        if agent_ref is not None:
+                            agent_ref[0] = agent
+                        effective_task_id = (
+                            sandbox_execution_task_id
+                            or session_id
+                            or str(uuid.uuid4())
+                        )
+                        result = agent.run_conversation(
+                            user_message=user_message,
+                            conversation_history=conversation_history,
+                            task_id=effective_task_id,
+                        )
+                        usage = {
+                            "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
+                            "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
+                            "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
+                        }
+                        # Include the effective session ID in the result so callers
+                        # (e.g. X-Hermes-Session-Id header) can track compression-
+                        # triggered session rotations. (#16938)
+                        _eff_sid = getattr(agent, "session_id", session_id)
+                        if isinstance(_eff_sid, str) and _eff_sid:
+                            if (
+                                sandbox_context_hash
+                                and _eff_sid != session_id
+                            ):
+                                db = self._ensure_session_db()
+                                if (
+                                    db is None
+                                    or not db.bind_sandbox_context(
+                                        _eff_sid,
+                                        sandbox_context_hash,
+                                    )
+                                ):
+                                    raise RuntimeError(
+                                        "Sandbox session context is unavailable"
+                                    )
+                            result["session_id"] = _eff_sid
+                        return result, usage
+                except Exception:
+                    if sandbox_task_key:
+                        raise RuntimeError("Sandbox execution failed") from None
+                    raise
                 finally:
                     clear_session_vars(tokens)
 
@@ -4779,6 +5734,9 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
+        session_root, root_err = self._parse_session_root_header(request)
+        if root_err is not None:
+            return root_err
 
         # Enforce concurrency limit (shared across all agent-serving
         # endpoints; configurable via gateway.api_server.max_concurrent_runs).
@@ -4973,7 +5931,10 @@ class APIServerAdapter(BasePlatformAdapter):
                             # environment state.
                             approval_token = set_current_session_key(approval_session_key)
                             session_tokens = self._bind_api_server_session(
+                                chat_id=session_id,
                                 session_key=approval_session_key,
+                                session_id=session_id,
+                                session_root=session_root or "",
                             )
                             register_gateway_notify(approval_session_key, _approval_notify)
                             r = agent.run_conversation(

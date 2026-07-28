@@ -1,0 +1,30 @@
+# Agent SaaS Hermes 0.19.0 compatibility overlay.
+#
+# The base is the immutable multi-platform index published for official tag
+# v2026.7.20 (Hermes 0.19.0), source commit
+# 3ef6bbd201263d354fd83ec55b3c306ded2eb72a. Google mirror.gcr.io is a
+# read-only Docker Hub cache. The tag and immutable digest below resolve to
+# the exact official index, avoiding regional blob truncation without changing
+# the verified image bytes.
+FROM mirror.gcr.io/nousresearch/hermes-agent:v2026.7.20@sha256:f7b35053268f532f98955195c909f15a230470fbcbdacaa9fdecb95707dad04a
+
+ARG PATCH_REVISION
+
+LABEL org.opencontainers.image.source="https://github.com/jubilee-hub/hermes-agent" \
+      org.opencontainers.image.version="0.19.0-session-root-init" \
+      org.opencontainers.image.revision="${PATCH_REVISION}" \
+      org.opencontainers.image.base.name="docker.io/nousresearch/hermes-agent:v2026.7.20" \
+      org.opencontainers.image.base.digest="sha256:f7b35053268f532f98955195c909f15a230470fbcbdacaa9fdecb95707dad04a" \
+      io.jubilee.hermes.official-revision="3ef6bbd201263d354fd83ec55b3c306ded2eb72a" \
+      io.jubilee.hermes.patch-revision="${PATCH_REVISION}" \
+      io.jubilee.agent-saas.parent-issue="jubilee-hub/agent-saas#140" \
+      io.jubilee.agent-saas.image-issue="jubilee-hub/agent-saas#700"
+
+# Only the four production modules and one startup permission hook required by
+# the Session Root / Artifact compatibility contract are overlaid. Everything
+# else remains byte-for-byte from the pinned official image.
+COPY --chown=root:root --chmod=0444 agent/runtime_cwd.py /opt/hermes/agent/runtime_cwd.py
+COPY --chown=root:root --chmod=0444 gateway/session_context.py /opt/hermes/gateway/session_context.py
+COPY --chown=root:root --chmod=0444 gateway/platforms/api_server.py /opt/hermes/gateway/platforms/api_server.py
+COPY --chown=root:root --chmod=0444 tools/file_tools.py /opt/hermes/tools/file_tools.py
+COPY --chown=root:root --chmod=0555 docker/agent-saas-workspace-perms.sh /etc/cont-init.d/03-agent-saas-workspace-perms

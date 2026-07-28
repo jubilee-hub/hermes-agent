@@ -2,18 +2,31 @@
 """File Tools Module - LLM agent file manipulation tools."""
 
 import errno
+import fnmatch
+import heapq
 import json
 import logging
 import os
 import posixpath
+import re
+import stat
+import subprocess
 import sys
+import tempfile
 import threading
+import uuid
 from pathlib import Path, PurePosixPath
 
 from agent.file_safety import get_read_block_error
 from tools.binary_extensions import has_binary_extension
 from tools.file_operations import (
+    LintResult,
+    PatchResult,
+    ReadResult,
+    SearchMatch,
+    SearchResult,
     ShellFileOperations,
+    WriteResult,
     normalize_read_pagination,
     normalize_search_pagination,
 )
@@ -58,7 +71,140 @@ def _expand_tilde(path: str) -> str:
 # Configurable via config.yaml:  file_read_max_chars: 200000
 # ---------------------------------------------------------------------------
 _DEFAULT_MAX_READ_CHARS = 100_000
+_MAX_SESSION_BUFFERED_FILE_BYTES = 32 * 1024 * 1024
+_MAX_SESSION_SEARCH_FILE_BYTES = 8 * 1024 * 1024
+_MAX_SESSION_SEARCH_TOTAL_BYTES = 64 * 1024 * 1024
+_MAX_SESSION_SEARCH_FILES = 4096
+_MAX_SESSION_SEARCH_CONTEXT = 100
+_MAX_SESSION_SEARCH_RESULTS = 1000
+_MAX_SESSION_SEARCH_OFFSET = 10_000
+_MAX_SESSION_SEARCH_ENTRIES = 100_000
+_SESSION_ROOT_SEARCH_TIMEOUT_SECONDS = 60
 _max_read_chars_cached: int | None = None
+
+
+_SESSION_ROOT_SEARCH_WORKER = r"""
+import json
+import os
+import re
+import sys
+from collections import deque
+
+root, pattern, mode, raw_context, raw_offset, raw_limit = sys.argv[1:]
+context = int(raw_context)
+offset = int(raw_offset)
+limit = int(raw_limit)
+
+
+def send(payload):
+    print(json.dumps(payload, ensure_ascii=False), flush=True)
+
+
+try:
+    expression = re.compile(pattern)
+    total = 0
+    matching_files = 0
+    truncated = False
+    stop_all = False
+
+    for directory, dirnames, filenames in os.walk(root):
+        dirnames.sort()
+        filenames.sort()
+        for filename in filenames:
+            absolute = os.path.join(directory, filename)
+            relative = os.path.relpath(absolute, root).replace(os.sep, "/")
+
+            if mode == "count":
+                count = 0
+                with open(absolute, "r", encoding="utf-8-sig", errors="replace") as stream:
+                    for line in stream:
+                        if expression.search(line.rstrip("\r\n")):
+                            count += 1
+                if count:
+                    if offset <= matching_files < offset + limit:
+                        send({"type": "count", "path": relative, "count": count})
+                    matching_files += 1
+                    total += count
+                continue
+
+            if mode == "files_only":
+                found = False
+                with open(absolute, "r", encoding="utf-8-sig", errors="replace") as stream:
+                    for line in stream:
+                        if expression.search(line.rstrip("\r\n")):
+                            found = True
+                            break
+                if found:
+                    if offset <= matching_files < offset + limit:
+                        send({"type": "file", "path": relative})
+                    matching_files += 1
+                continue
+
+            before = deque(maxlen=context)
+            after_until = 0
+            last_emitted = 0
+
+            def emit_row(line_number, content):
+                nonlocal_total[0] += 1
+                ordinal = nonlocal_total[0]
+                if ordinal <= offset:
+                    return False
+                if ordinal <= offset + limit:
+                    send({
+                        "type": "match",
+                        "path": relative,
+                        "line": line_number,
+                        "content": content[:500],
+                    })
+                    return False
+                return True
+
+            nonlocal_total = [total]
+            with open(absolute, "r", encoding="utf-8-sig", errors="replace") as stream:
+                for line_number, line in enumerate(stream, start=1):
+                    content = line.rstrip("\r\n")
+                    matched = bool(expression.search(content))
+                    if matched:
+                        for prior_number, prior_content in before:
+                            if prior_number > last_emitted:
+                                if emit_row(prior_number, prior_content):
+                                    truncated = True
+                                    stop_all = True
+                                    break
+                                last_emitted = prior_number
+                        if stop_all:
+                            break
+                        if line_number > last_emitted:
+                            if emit_row(line_number, content):
+                                truncated = True
+                                stop_all = True
+                                break
+                            last_emitted = line_number
+                        after_until = max(after_until, line_number + context)
+                    elif line_number <= after_until and line_number > last_emitted:
+                        if emit_row(line_number, content):
+                            truncated = True
+                            stop_all = True
+                            break
+                        last_emitted = line_number
+                    before.append((line_number, content[:500]))
+            total = nonlocal_total[0]
+            if stop_all:
+                break
+        if stop_all:
+            break
+
+    if mode in {"count", "files_only"}:
+        truncated = matching_files > offset + limit
+    send({
+        "type": "summary",
+        "total_count": total if mode != "files_only" else matching_files,
+        "matching_files": matching_files,
+        "truncated": truncated,
+    })
+except Exception as exc:
+    send({"type": "summary", "error": str(exc)})
+"""
 
 
 def _get_max_read_chars() -> int:
@@ -165,6 +311,28 @@ def _resolve_path(filepath: str, task_id: str = "default") -> Path | PurePosixPa
 # sessions get the same protection. See references/worktree-cwd-discipline.md.
 _TERMINAL_CWD_SENTINELS = frozenset({"", ".", "./", "auto", "cwd"})
 _CONTAINER_PATH_BACKENDS_FALLBACK = frozenset({"docker", "singularity", "modal", "daytona"})
+
+
+class SessionRootPathError(ValueError):
+    """Raised when a file-tool request cannot stay inside its session root."""
+
+
+class _SessionRootWalkBudget:
+    """Bound lazy Session Root traversal before metadata or file reads."""
+
+    __slots__ = ("exhausted", "max_entries", "visited")
+
+    def __init__(self, max_entries: int):
+        self.max_entries = max_entries
+        self.visited = 0
+        self.exhausted = False
+
+    def consume(self) -> bool:
+        if self.visited >= self.max_entries:
+            self.exhausted = True
+            return False
+        self.visited += 1
+        return True
 
 
 def _terminal_env_type_for_task(task_id: str = "default") -> str:
@@ -361,6 +529,92 @@ def _resolve_base_dir(
     return base.resolve()
 
 
+def _session_file_root(task_id: str = "default") -> Path | None:
+    """Return the validated request-scoped file root, if one is active.
+
+    Session-root enforcement currently targets the local file backend used by
+    the API runtime.  Failing closed on remote/container path namespaces avoids
+    pretending that host ``Path.resolve`` can validate paths inside a separate
+    filesystem.
+    """
+    try:
+        from agent.runtime_cwd import resolve_session_file_root
+
+        root = resolve_session_file_root()
+    except Exception as exc:
+        raise SessionRootPathError(
+            "Session file root context is unavailable"
+        ) from exc
+    if root is None:
+        return None
+    if _uses_container_paths(task_id):
+        raise SessionRootPathError(
+            "Session file root enforcement is unavailable for this file backend"
+        )
+    try:
+        resolved = root.resolve(strict=True)
+    except (OSError, ValueError) as exc:
+        raise SessionRootPathError("Configured session file root is not available") from exc
+    if not resolved.is_dir():
+        raise SessionRootPathError("Configured session file root is not a directory")
+    return resolved
+
+
+def _ensure_under_session_root(path: Path, root: Path) -> Path:
+    """Resolve symlinks and reject any path outside ``root``."""
+    try:
+        resolved = path.resolve(strict=False)
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise SessionRootPathError("Path escapes current session file root") from exc
+    except OSError as exc:
+        raise SessionRootPathError(
+            "Path cannot be resolved within current session file root"
+        ) from exc
+    return resolved
+
+
+def _session_root_hardlink_error(path: Path, task_id: str = "default") -> str | None:
+    """Reject regular files whose other hardlink may live outside the root."""
+    if _session_file_root(task_id) is None:
+        return None
+    try:
+        metadata = path.stat()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return "Path cannot be verified within current session file root"
+    if stat.S_ISREG(metadata.st_mode) and metadata.st_nlink > 1:
+        return "Path has multiple filesystem links and is unsafe in this session file root"
+    return None
+
+
+def _session_root_tree_error(path: Path, task_id: str = "default") -> str | None:
+    """Reject search trees containing symlinks that resolve outside the root."""
+    root = _session_file_root(task_id)
+    if root is None:
+        return None
+    hardlink_error = _session_root_hardlink_error(path, task_id)
+    if hardlink_error:
+        return hardlink_error
+    if not path.is_dir():
+        return None
+    for current, dirnames, filenames in os.walk(path, followlinks=False):
+        current_path = Path(current)
+        for name in (*dirnames, *filenames):
+            candidate = current_path / name
+            if candidate.is_symlink():
+                try:
+                    _ensure_under_session_root(candidate, root)
+                except SessionRootPathError:
+                    return "Search path contains a symlink that escapes current session file root"
+                continue
+            hardlink_error = _session_root_hardlink_error(candidate, task_id)
+            if hardlink_error:
+                return hardlink_error
+    return None
+
+
 def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path | PurePosixPath:
     """Resolve *filepath* against the task's absolute base directory.
 
@@ -371,6 +625,16 @@ def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path | Pu
     translated to ``C:\\Users\\...`` before resolution so file tools don't
     treat them as relative ``\\c\\Users\\...`` under the process cwd.
     """
+    root = _session_file_root(task_id)
+    if root is not None:
+        expanded = Path(_expand_tilde(filepath))
+        if ".." in expanded.parts:
+            raise SessionRootPathError(
+                "Path contains '..' traversal in current session file root"
+            )
+        candidate = expanded if expanded.is_absolute() else root / expanded
+        return _ensure_under_session_root(candidate, root)
+
     container_paths = _uses_container_paths(task_id)
     if container_paths:
         expanded = _expand_tilde(filepath)
@@ -396,6 +660,988 @@ def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path | Pu
         return p.resolve()
     resolved = _resolve_base_dir(task_id, container_paths=False) / p
     return resolved.resolve()
+
+
+class _SessionRootFileOperations:
+    """Local file operations anchored to directory descriptors.
+
+    ``Path.resolve`` is useful validation but cannot close the race between
+    validation and a later shell open.  This adapter walks every component
+    from ``/`` with ``O_NOFOLLOW`` and performs reads/writes through pinned
+    directory descriptors.  A concurrent rename of an ancestor therefore
+    cannot redirect an operation outside the request-scoped root.
+    """
+
+    def __init__(self, root: Path, delegate: ShellFileOperations):
+        self.root = root
+        self.delegate = delegate
+
+    @staticmethod
+    def _dir_flags() -> int:
+        flags = os.O_RDONLY
+        flags |= getattr(os, "O_DIRECTORY", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        return flags
+
+    @staticmethod
+    def _file_flags(flags: int) -> int:
+        return flags | getattr(os, "O_NOFOLLOW", 0)
+
+    def _relative_parts(self, path: str) -> tuple[str, ...]:
+        candidate = Path(_expand_tilde(path))
+        if ".." in candidate.parts:
+            raise SessionRootPathError(
+                "Path contains '..' traversal in current session file root"
+            )
+        if candidate.is_absolute():
+            try:
+                candidate = candidate.relative_to(self.root)
+            except ValueError as exc:
+                raise SessionRootPathError(
+                    "Path escapes current session file root"
+                ) from exc
+        parts = tuple(part for part in candidate.parts if part not in {"", "."})
+        if any(part in {"..", os.sep} for part in parts):
+            raise SessionRootPathError(
+                "Path escapes current session file root"
+            )
+        return parts
+
+    def _open_root(self) -> int:
+        """Open the absolute root without following any path component."""
+        if os.name != "posix":
+            raise SessionRootPathError(
+                "Secure session file root operations require a POSIX runtime"
+            )
+        current = os.open(os.sep, self._dir_flags())
+        try:
+            for part in self.root.parts[1:]:
+                next_fd = os.open(part, self._dir_flags(), dir_fd=current)
+                os.close(current)
+                current = next_fd
+            return current
+        except Exception:
+            os.close(current)
+            raise
+
+    def _open_parent(
+        self,
+        path: str,
+        *,
+        create: bool = False,
+    ) -> tuple[int, str, bool]:
+        parts = self._relative_parts(path)
+        if not parts:
+            raise SessionRootPathError("Session file root itself is not a file")
+        current = self._open_root()
+        created = False
+        try:
+            for part in parts[:-1]:
+                try:
+                    next_fd = os.open(part, self._dir_flags(), dir_fd=current)
+                except FileNotFoundError:
+                    if not create:
+                        raise
+                    os.mkdir(part, mode=0o755, dir_fd=current)
+                    created = True
+                    next_fd = os.open(part, self._dir_flags(), dir_fd=current)
+                os.close(current)
+                current = next_fd
+            return current, parts[-1], created
+        except Exception:
+            os.close(current)
+            raise
+
+    @staticmethod
+    def _reject_unsafe_metadata(metadata: os.stat_result) -> None:
+        if stat.S_ISLNK(metadata.st_mode):
+            raise SessionRootPathError(
+                "Path is a symlink in current session file root"
+            )
+        if stat.S_ISREG(metadata.st_mode) and metadata.st_nlink > 1:
+            raise SessionRootPathError(
+                "Path has multiple filesystem links and is unsafe in this "
+                "session file root"
+            )
+
+    def _read_bytes(
+        self,
+        path: str,
+        *,
+        max_bytes: int = _MAX_SESSION_BUFFERED_FILE_BYTES,
+    ) -> tuple[bytes, os.stat_result]:
+        parent_fd, name, _ = self._open_parent(path)
+        try:
+            fd = os.open(
+                name,
+                self._file_flags(os.O_RDONLY),
+                dir_fd=parent_fd,
+            )
+            try:
+                metadata = os.fstat(fd)
+                self._reject_unsafe_metadata(metadata)
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise SessionRootPathError("Path is not a regular file")
+                if metadata.st_size > max_bytes:
+                    raise SessionRootPathError(
+                        f"File exceeds the {max_bytes}-byte secure buffer limit"
+                    )
+                chunks = []
+                bytes_read = 0
+                while True:
+                    chunk = os.read(fd, 1024 * 1024)
+                    if not chunk:
+                        break
+                    bytes_read += len(chunk)
+                    if bytes_read > max_bytes:
+                        raise SessionRootPathError(
+                            f"File exceeds the {max_bytes}-byte secure buffer limit"
+                        )
+                    chunks.append(chunk)
+                return b"".join(chunks), metadata
+            finally:
+                os.close(fd)
+        finally:
+            os.close(parent_fd)
+
+    @staticmethod
+    def _decode(data: bytes) -> str:
+        return data.decode("utf-8-sig", errors="replace")
+
+    def read_file_raw(self, path: str) -> ReadResult:
+        try:
+            data, _metadata = self._read_bytes(path)
+            text = self._decode(data)
+            return ReadResult(
+                content=text,
+                total_lines=len(text.splitlines()),
+                file_size=len(data),
+            )
+        except FileNotFoundError:
+            return ReadResult(error=f"File not found: {path}")
+        except Exception as exc:
+            return ReadResult(error=str(exc))
+
+    def read_file(self, path: str, offset: int = 1, limit: int = 500) -> ReadResult:
+        offset, limit = normalize_read_pagination(offset, limit)
+        parent_fd = file_fd = None
+        try:
+            parent_fd, name, _ = self._open_parent(path)
+            file_fd = os.open(
+                name,
+                self._file_flags(os.O_RDONLY),
+                dir_fd=parent_fd,
+            )
+            metadata = os.fstat(file_fd)
+            self._reject_unsafe_metadata(metadata)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise SessionRootPathError("Path is not a regular file")
+            page = []
+            total_lines = 0
+            clamped_line = False
+            from tools.tool_output_limits import get_max_line_length
+
+            max_total_chars = _get_max_read_chars()
+            max_line_chars = get_max_line_length()
+            remaining_chars = max_total_chars
+            with os.fdopen(
+                file_fd,
+                "r",
+                encoding="utf-8-sig",
+                errors="replace",
+            ) as stream:
+                file_fd = None
+                while True:
+                    first_part = stream.readline(max_line_chars + 1)
+                    if first_part == "":
+                        break
+                    total_lines += 1
+                    in_page = offset <= total_lines < offset + limit
+                    if in_page:
+                        prefix_budget = len(str(total_lines)) + 2
+                        available = max(0, remaining_chars - prefix_budget)
+                        captured = first_part[
+                            : min(max_line_chars, available)
+                        ].rstrip("\r\n")
+                        if captured or available > 0:
+                            page.append(captured)
+                            remaining_chars -= len(captured) + prefix_budget
+                        if (
+                            len(first_part.rstrip("\r\n")) > len(captured)
+                            or available == 0
+                        ):
+                            clamped_line = True
+                    line_complete = first_part.endswith("\n")
+                    if len(first_part) > max_line_chars and not line_complete:
+                        clamped_line = clamped_line or in_page
+                    while not line_complete:
+                        next_part = stream.readline(max_line_chars + 1)
+                        if next_part == "":
+                            break
+                        if in_page:
+                            # A bounded second chunk means this physical line
+                            # exceeded its line budget. Keep only the first
+                            # bounded segment and drain the rest incrementally.
+                            clamped_line = True
+                        line_complete = next_part.endswith("\n")
+            return ReadResult(
+                content=self.delegate._add_line_numbers("\n".join(page), offset)
+                if page
+                else "",
+                total_lines=total_lines,
+                file_size=metadata.st_size,
+                truncated=clamped_line or offset - 1 + limit < total_lines,
+                hint=(
+                    "One or more requested lines exceeded the secure read "
+                    "budget and were clamped."
+                    if clamped_line
+                    else None
+                ),
+            )
+        except FileNotFoundError:
+            return ReadResult(error=f"File not found: {path}")
+        except Exception as exc:
+            return ReadResult(error=str(exc))
+        finally:
+            if file_fd is not None:
+                os.close(file_fd)
+            if parent_fd is not None:
+                os.close(parent_fd)
+
+    def extract_document(self, path: str) -> tuple[str, int]:
+        """Extract a document from a descriptor-pinned temporary snapshot."""
+        from tools.read_extract import extract_document_text
+
+        data, metadata = self._read_bytes(path)
+        suffix = Path(path).suffix.lower()
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                prefix="hermes-session-document-",
+                suffix=suffix,
+                delete=False,
+            ) as snapshot:
+                snapshot.write(data)
+                snapshot.flush()
+                temp_path = snapshot.name
+            return extract_document_text(temp_path), metadata.st_size
+        finally:
+            if temp_path is not None:
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
+
+    def _check_lint(self, path: str, content: str | None = None) -> LintResult:
+        from tools.file_operations import LINTERS, LINTERS_INPROC
+
+        extension = Path(path).suffix.lower()
+        linter = LINTERS_INPROC.get(extension)
+        if linter is not None and content is not None:
+            ok, error = linter(content)
+            if error == "__SKIP__":
+                return LintResult(
+                    skipped=True,
+                    message=f"No linter available for {extension}",
+                )
+            return LintResult(success=ok, output="" if ok else error)
+        if content is None or extension not in LINTERS:
+            return LintResult(
+                skipped=True,
+                message=f"No linter available for {extension}",
+            )
+
+        # Shell linters require a pathname. Run them against an owner-only
+        # snapshot rather than the mutable Session Root path, so syntax checks
+        # retain their v0.19 behavior without reopening a path race.
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                prefix="hermes-session-lint-",
+                suffix=extension,
+                mode="w",
+                encoding="utf-8",
+                delete=False,
+            ) as snapshot:
+                snapshot.write(content)
+                snapshot.flush()
+                temp_path = snapshot.name
+            result = self.delegate._check_lint(temp_path, content=content)
+            if result.output:
+                result.output = result.output.replace(temp_path, path)
+            if result.message:
+                result.message = result.message.replace(temp_path, path)
+            return result
+        finally:
+            if temp_path is not None:
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
+
+    def write_file(self, path: str, content: str) -> WriteResult:
+        from tools.file_operations import (
+            LINTERS_INPROC,
+            _FAIL_CLOSED_INPROC_EXTS,
+            _UTF8_BOM,
+            _has_bom,
+            _normalize_line_endings,
+        )
+
+        extension = Path(path).suffix.lower()
+        linter = (
+            LINTERS_INPROC.get(extension)
+            if extension in _FAIL_CLOSED_INPROC_EXTS
+            else None
+        )
+        if linter is not None:
+            ok, error = linter(content)
+            if not ok and error != "__SKIP__":
+                return WriteResult(
+                    error=(
+                        f"Refusing to write '{path}': candidate content fails "
+                        f"{extension} syntax validation ({error})."
+                    )
+                )
+
+        parent_fd = None
+        temp_name = None
+        try:
+            parent_fd, name, dirs_created = self._open_parent(path, create=True)
+            existing_mode = None
+            existing_text = None
+            try:
+                existing_fd = os.open(
+                    name,
+                    self._file_flags(os.O_RDONLY),
+                    dir_fd=parent_fd,
+                )
+            except FileNotFoundError:
+                existing_fd = None
+            if existing_fd is not None:
+                try:
+                    metadata = os.fstat(existing_fd)
+                    self._reject_unsafe_metadata(metadata)
+                    if not stat.S_ISREG(metadata.st_mode):
+                        return WriteResult(error=f"Path is not a regular file: {path}")
+                    if metadata.st_size > _MAX_SESSION_BUFFERED_FILE_BYTES:
+                        return WriteResult(
+                            error=(
+                                "Existing file exceeds the secure buffer limit; "
+                                "refusing a whole-file replacement"
+                            )
+                        )
+                    existing_mode = stat.S_IMODE(metadata.st_mode)
+                    existing_data = bytearray()
+                    while True:
+                        chunk = os.read(existing_fd, 1024 * 1024)
+                        if not chunk:
+                            break
+                        existing_data.extend(chunk)
+                    existing_text = bytes(existing_data).decode(
+                        "utf-8",
+                        errors="replace",
+                    )
+                finally:
+                    os.close(existing_fd)
+
+            if existing_text is not None:
+                if "\r\n" in existing_text and "\n" in content:
+                    content = _normalize_line_endings(content, "\r\n")
+                if existing_text.startswith(_UTF8_BOM) and not _has_bom(content):
+                    content = _UTF8_BOM + content
+
+            payload = content.encode("utf-8")
+            temp_name = f".hermes-session-{uuid.uuid4().hex}.tmp"
+            temp_fd = os.open(
+                temp_name,
+                self._file_flags(os.O_WRONLY | os.O_CREAT | os.O_EXCL),
+                existing_mode or 0o600,
+                dir_fd=parent_fd,
+            )
+            try:
+                view = memoryview(payload)
+                while view:
+                    written = os.write(temp_fd, view)
+                    view = view[written:]
+                if existing_mode is not None:
+                    os.fchmod(temp_fd, existing_mode)
+                os.fsync(temp_fd)
+            finally:
+                os.close(temp_fd)
+
+            os.replace(
+                temp_name,
+                name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+            temp_name = None
+            lint = self._check_lint(path, content=content)
+            return WriteResult(
+                bytes_written=len(payload),
+                dirs_created=dirs_created,
+                lint=lint.to_dict(),
+            )
+        except Exception as exc:
+            return WriteResult(error=str(exc))
+        finally:
+            if parent_fd is not None:
+                if temp_name is not None:
+                    try:
+                        os.unlink(temp_name, dir_fd=parent_fd)
+                    except OSError:
+                        pass
+                os.close(parent_fd)
+
+    def patch_replace(
+        self,
+        path: str,
+        old_string: str,
+        new_string: str,
+        replace_all: bool = False,
+    ) -> PatchResult:
+        import difflib
+
+        from tools.fuzzy_match import fuzzy_find_and_replace
+
+        before_result = self.read_file_raw(path)
+        if before_result.error:
+            return PatchResult(error=before_result.error)
+        after, count, _strategy, error = fuzzy_find_and_replace(
+            before_result.content,
+            old_string,
+            new_string,
+            replace_all,
+        )
+        if error or count == 0:
+            return PatchResult(error=error or f"Could not find match in {path}")
+        write_result = self.write_file(path, after)
+        if write_result.error:
+            return PatchResult(error=write_result.error)
+        diff = "".join(
+            difflib.unified_diff(
+                before_result.content.splitlines(keepends=True),
+                after.splitlines(keepends=True),
+                fromfile=f"a/{path}",
+                tofile=f"b/{path}",
+            )
+        )
+        return PatchResult(
+            success=True,
+            diff=diff,
+            files_modified=[path],
+            lint=write_result.lint,
+        )
+
+    def patch_v4a(self, patch_content: str) -> PatchResult:
+        from tools.patch_parser import apply_v4a_operations, parse_v4a_patch
+
+        operations, error = parse_v4a_patch(patch_content)
+        if error:
+            return PatchResult(error=f"Failed to parse patch: {error}")
+        return apply_v4a_operations(operations, self)
+
+    def delete_file(self, path: str) -> WriteResult:
+        parent_fd = None
+        try:
+            parent_fd, name, _ = self._open_parent(path)
+            metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            self._reject_unsafe_metadata(metadata)
+            if not stat.S_ISREG(metadata.st_mode):
+                return WriteResult(error=f"Path is not a regular file: {path}")
+            os.unlink(name, dir_fd=parent_fd)
+            return WriteResult()
+        except Exception as exc:
+            return WriteResult(error=str(exc))
+        finally:
+            if parent_fd is not None:
+                os.close(parent_fd)
+
+    def move_file(self, src: str, dst: str) -> WriteResult:
+        src_fd = dst_fd = None
+        moved = False
+        try:
+            src_fd, src_name, _ = self._open_parent(src)
+            dst_fd, dst_name, _ = self._open_parent(dst, create=True)
+            pinned_fd = os.open(
+                src_name,
+                self._file_flags(os.O_RDONLY),
+                dir_fd=src_fd,
+            )
+            try:
+                pinned = os.fstat(pinned_fd)
+                self._reject_unsafe_metadata(pinned)
+                if not stat.S_ISREG(pinned.st_mode):
+                    return WriteResult(
+                        error=f"Move source is not a regular file: {src}"
+                    )
+                try:
+                    os.stat(dst_name, dir_fd=dst_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    return WriteResult(
+                        error=f"Move destination already exists: {dst}"
+                    )
+
+                # Rename is atomic and does not follow a swapped symlink.
+                # Re-verify the destination against the descriptor-pinned
+                # source inode before declaring success.
+                os.rename(
+                    src_name,
+                    dst_name,
+                    src_dir_fd=src_fd,
+                    dst_dir_fd=dst_fd,
+                )
+                moved = True
+                destination = os.stat(
+                    dst_name,
+                    dir_fd=dst_fd,
+                    follow_symlinks=False,
+                )
+                self._reject_unsafe_metadata(destination)
+                if (destination.st_dev, destination.st_ino) != (
+                    pinned.st_dev,
+                    pinned.st_ino,
+                ):
+                    raise SessionRootPathError(
+                        "Move source changed during the operation"
+                    )
+            finally:
+                os.close(pinned_fd)
+            moved = False
+            return WriteResult()
+        except Exception as exc:
+            return WriteResult(error=str(exc))
+        finally:
+            if moved and dst_fd is not None:
+                try:
+                    os.unlink(dst_name, dir_fd=dst_fd)
+                except OSError:
+                    pass
+            if src_fd is not None:
+                os.close(src_fd)
+            if dst_fd is not None:
+                os.close(dst_fd)
+
+    @staticmethod
+    def _matches_file_glob(
+        relative: tuple[str, ...],
+        file_glob: str | None,
+    ) -> bool:
+        if not file_glob:
+            return True
+        return (
+            fnmatch.fnmatch(relative[-1], file_glob)
+            or fnmatch.fnmatch("/".join(relative), file_glob)
+        )
+
+    def _walk_files(
+        self,
+        path: str,
+        *,
+        include_data: bool,
+        file_glob: str | None = None,
+        walk_budget: _SessionRootWalkBudget | None = None,
+    ):
+        parts = self._relative_parts(path)
+        current = None
+        try:
+            if parts:
+                if walk_budget is not None and not walk_budget.consume():
+                    return
+                parent_fd, name, _ = self._open_parent(path)
+                try:
+                    metadata = os.stat(
+                        name,
+                        dir_fd=parent_fd,
+                        follow_symlinks=False,
+                    )
+                    self._reject_unsafe_metadata(metadata)
+                    if stat.S_ISREG(metadata.st_mode):
+                        if not self._matches_file_glob(parts, file_glob):
+                            return
+                        data = None
+                        pinned = metadata
+                        if (
+                            include_data
+                            and metadata.st_size
+                            <= _MAX_SESSION_SEARCH_FILE_BYTES
+                        ):
+                            data, pinned = self._read_bytes(
+                                path,
+                                max_bytes=_MAX_SESSION_SEARCH_FILE_BYTES,
+                            )
+                        yield parts, data, pinned
+                        return
+                    if not stat.S_ISDIR(metadata.st_mode):
+                        raise SessionRootPathError(
+                            "Search path is not a regular file or directory"
+                        )
+                    current = os.open(
+                        name,
+                        self._dir_flags(),
+                        dir_fd=parent_fd,
+                    )
+                finally:
+                    os.close(parent_fd)
+            else:
+                current = self._open_root()
+
+            def walk(directory_fd: int, relative: tuple[str, ...]):
+                with os.scandir(directory_fd) as entries:
+                    for entry in entries:
+                        if (
+                            walk_budget is not None
+                            and not walk_budget.consume()
+                        ):
+                            return
+                        name = entry.name
+                        if name.startswith("."):
+                            continue
+                        metadata = os.stat(
+                            name,
+                            dir_fd=directory_fd,
+                            follow_symlinks=False,
+                        )
+                        if stat.S_ISLNK(metadata.st_mode):
+                            # Never follow links from a Session Root tree.
+                            continue
+                        child_relative = relative + (name,)
+                        if stat.S_ISDIR(metadata.st_mode):
+                            child_fd = os.open(
+                                name,
+                                self._dir_flags(),
+                                dir_fd=directory_fd,
+                            )
+                            try:
+                                yield from walk(child_fd, child_relative)
+                            finally:
+                                os.close(child_fd)
+                            if (
+                                walk_budget is not None
+                                and walk_budget.exhausted
+                            ):
+                                return
+                        elif stat.S_ISREG(metadata.st_mode):
+                            if not self._matches_file_glob(
+                                child_relative,
+                                file_glob,
+                            ):
+                                continue
+                            file_fd = os.open(
+                                name,
+                                self._file_flags(os.O_RDONLY),
+                                dir_fd=directory_fd,
+                            )
+                            try:
+                                pinned = os.fstat(file_fd)
+                                self._reject_unsafe_metadata(pinned)
+                                data = None
+                                if (
+                                    include_data
+                                    and pinned.st_size
+                                    <= _MAX_SESSION_SEARCH_FILE_BYTES
+                                ):
+                                    chunks = []
+                                    bytes_read = 0
+                                    while True:
+                                        chunk = os.read(file_fd, 1024 * 1024)
+                                        if not chunk:
+                                            break
+                                        bytes_read += len(chunk)
+                                        if (
+                                            bytes_read
+                                            > _MAX_SESSION_SEARCH_FILE_BYTES
+                                        ):
+                                            chunks = []
+                                            break
+                                        chunks.append(chunk)
+                                    if chunks or pinned.st_size == 0:
+                                        data = b"".join(chunks)
+                                yield child_relative, data, pinned
+                            finally:
+                                os.close(file_fd)
+
+            yield from walk(current, parts)
+        finally:
+            if current is not None:
+                os.close(current)
+
+    def _search_content_snapshot(
+        self,
+        pattern: str,
+        path: str,
+        *,
+        file_glob: str | None,
+        limit: int,
+        offset: int,
+        output_mode: str,
+        context: int,
+    ) -> SearchResult:
+        matches: list[SearchMatch] = []
+        counts: dict[str, int] = {}
+        files_only: list[str] = []
+        skipped_oversized = 0
+        snapshot_limited = False
+        walk_budget = _SessionRootWalkBudget(_MAX_SESSION_SEARCH_ENTRIES)
+
+        with tempfile.TemporaryDirectory(
+            prefix="hermes-session-search-"
+        ) as snapshot_dir:
+            snapshot_root = Path(snapshot_dir)
+            source_metadata: dict[str, tuple[str, float]] = {}
+            total_bytes = 0
+            total_files = 0
+            records = self._walk_files(
+                path,
+                include_data=True,
+                file_glob=file_glob,
+                walk_budget=walk_budget,
+            )
+            try:
+                for relative, data, metadata in records:
+                    if data is None:
+                        skipped_oversized += 1
+                        continue
+                    if (
+                        total_files >= _MAX_SESSION_SEARCH_FILES
+                        or total_bytes + len(data)
+                        > _MAX_SESSION_SEARCH_TOTAL_BYTES
+                    ):
+                        snapshot_limited = True
+                        break
+                    snapshot_path = snapshot_root.joinpath(*relative)
+                    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+                    with snapshot_path.open("xb") as snapshot:
+                        snapshot.write(data)
+                    snapshot_path.chmod(0o600)
+                    relative_key = "/".join(relative)
+                    source_metadata[relative_key] = (
+                        str(self.root.joinpath(*relative)),
+                        metadata.st_mtime,
+                    )
+                    total_bytes += len(data)
+                    total_files += 1
+            finally:
+                records.close()
+            enumeration_limited = walk_budget.exhausted
+
+            if not source_metadata:
+                reasons = []
+                if skipped_oversized:
+                    reasons.append(
+                        f"Skipped {skipped_oversized} file(s) over the "
+                        f"{_MAX_SESSION_SEARCH_FILE_BYTES}-byte Session Root "
+                        "search size limit"
+                    )
+                if snapshot_limited:
+                    reasons.append("request snapshot budget reached")
+                if enumeration_limited:
+                    reasons.append(
+                        "Session Root search enumeration budget reached "
+                        f"({_MAX_SESSION_SEARCH_ENTRIES} entries)"
+                    )
+                reason = "; ".join(reasons) or None
+                return SearchResult(
+                    total_count=0,
+                    truncated=bool(reason),
+                    limit_reason=reason,
+                )
+
+            child_mode = (
+                output_mode
+                if output_mode in {"count", "files_only"}
+                else "content"
+            )
+            child_env = {
+                "PATH": os.environ.get("PATH", ""),
+                "PYTHONIOENCODING": "utf-8",
+            }
+            try:
+                completed = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        _SESSION_ROOT_SEARCH_WORKER,
+                        str(snapshot_root),
+                        pattern,
+                        child_mode,
+                        str(context),
+                        str(offset),
+                        str(limit),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=_SESSION_ROOT_SEARCH_TIMEOUT_SECONDS,
+                    env=child_env,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired:
+                return SearchResult(
+                    error=(
+                        "Session Root search timed out after "
+                        f"{_SESSION_ROOT_SEARCH_TIMEOUT_SECONDS} seconds"
+                    )
+                )
+            if completed.returncode != 0:
+                return SearchResult(
+                    error=(
+                        "Session Root search worker failed: "
+                        f"{completed.stderr.strip()[:500]}"
+                    )
+                )
+
+            summary = None
+            try:
+                for raw_line in completed.stdout.splitlines():
+                    if not raw_line:
+                        continue
+                    event = json.loads(raw_line)
+                    event_type = event.get("type")
+                    if event_type == "summary":
+                        summary = event
+                        continue
+                    relative_key = event.get("path")
+                    source = source_metadata.get(relative_key)
+                    if source is None:
+                        continue
+                    display, mtime = source
+                    if event_type == "match":
+                        matches.append(
+                            SearchMatch(
+                                path=display,
+                                line_number=int(event["line"]),
+                                content=str(event["content"])[:500],
+                                mtime=mtime,
+                            )
+                        )
+                    elif event_type == "count":
+                        counts[display] = int(event["count"])
+                    elif event_type == "file":
+                        files_only.append(display)
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                return SearchResult(
+                    error=f"Invalid Session Root search worker output: {exc}"
+                )
+
+            if summary is None:
+                return SearchResult(
+                    error="Session Root search worker returned no summary"
+                )
+            if summary.get("error"):
+                return SearchResult(
+                    error=f"Invalid search pattern: {summary['error']}"
+                )
+
+            reasons = []
+            if skipped_oversized:
+                reasons.append(
+                    f"Skipped {skipped_oversized} file(s) over the "
+                    f"{_MAX_SESSION_SEARCH_FILE_BYTES}-byte Session Root "
+                    "search size limit"
+                )
+            if snapshot_limited:
+                reasons.append(
+                    "Session Root search request snapshot budget reached "
+                    f"({_MAX_SESSION_SEARCH_FILES} files / "
+                    f"{_MAX_SESSION_SEARCH_TOTAL_BYTES} bytes)"
+                )
+            if enumeration_limited:
+                reasons.append(
+                    "Session Root search enumeration budget reached "
+                    f"({_MAX_SESSION_SEARCH_ENTRIES} entries)"
+                )
+            limit_reason = "; ".join(reasons) or None
+            result_kwargs = {
+                "total_count": int(summary.get("total_count", 0)),
+                "truncated": bool(summary.get("truncated")) or bool(limit_reason),
+                "limit_reason": limit_reason,
+            }
+            if child_mode == "files_only":
+                return SearchResult(files=files_only, **result_kwargs)
+            if child_mode == "count":
+                return SearchResult(counts=counts, **result_kwargs)
+            return SearchResult(matches=matches, **result_kwargs)
+
+    def search(
+        self,
+        pattern: str,
+        path: str = ".",
+        target: str = "content",
+        file_glob: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+        output_mode: str = "content",
+        context: int = 0,
+    ) -> SearchResult:
+        try:
+            if offset > _MAX_SESSION_SEARCH_OFFSET:
+                return SearchResult(
+                    error=(
+                        "Session Root search offset exceeds the "
+                        f"{_MAX_SESSION_SEARCH_OFFSET}-result pagination limit"
+                    )
+                )
+            limit = min(max(1, limit), _MAX_SESSION_SEARCH_RESULTS)
+            context = min(max(0, context), _MAX_SESSION_SEARCH_CONTEXT)
+            if target == "files":
+                glob = pattern if any(ch in pattern for ch in "*?[]") else f"*{pattern}"
+                keep = max(offset + limit, 1)
+                newest: list[tuple[float, str]] = []
+                total = 0
+                walk_budget = _SessionRootWalkBudget(
+                    _MAX_SESSION_SEARCH_ENTRIES
+                )
+                records = self._walk_files(
+                    path,
+                    include_data=False,
+                    walk_budget=walk_budget,
+                )
+                try:
+                    for relative, _data, metadata in records:
+                        if not fnmatch.fnmatch(relative[-1], glob):
+                            continue
+                        total += 1
+                        candidate = (
+                            metadata.st_mtime,
+                            str(self.root.joinpath(*relative)),
+                        )
+                        if len(newest) < keep:
+                            heapq.heappush(newest, candidate)
+                        elif candidate > newest[0]:
+                            heapq.heapreplace(newest, candidate)
+                finally:
+                    records.close()
+                enumeration_limited = walk_budget.exhausted
+                files = [
+                    item[1]
+                    for item in sorted(newest, reverse=True)
+                ]
+                return SearchResult(
+                    files=files[offset:offset + limit],
+                    total_count=total,
+                    truncated=offset + limit < total or enumeration_limited,
+                    limit_reason=(
+                        "Session Root file search enumeration budget reached "
+                        f"({_MAX_SESSION_SEARCH_ENTRIES} entries)"
+                        if enumeration_limited
+                        else None
+                    ),
+                )
+
+            return self._search_content_snapshot(
+                pattern,
+                path,
+                file_glob=file_glob,
+                limit=limit,
+                offset=offset,
+                output_mode=output_mode,
+                context=context,
+            )
+        except Exception as exc:
+            return SearchResult(error=str(exc))
 
 
 def _path_resolution_warning(filepath: str, resolved: Path, task_id: str = "default") -> str | None:
@@ -597,6 +1843,8 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
     """Return an error message if the path targets a sensitive system location."""
     try:
         resolved = str(_resolve_path_for_task(filepath, task_id))
+    except SessionRootPathError as exc:
+        return str(exc)
     except (OSError, ValueError):
         resolved = filepath
     normalized = os.path.normpath(_expand_tilde(filepath))
@@ -700,6 +1948,8 @@ def _check_cross_profile_path(filepath: str, task_id: str = "default") -> str | 
     # classified against the right base.
     try:
         resolved = str(_resolve_path_for_task(filepath, task_id))
+    except SessionRootPathError as exc:
+        return str(exc)
     except (OSError, ValueError):
         resolved = filepath
 
@@ -1094,7 +2344,16 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
     file_ops = ShellFileOperations(terminal_env)
     with _file_ops_lock:
         _file_ops_cache[task_id] = file_ops
-    return file_ops
+        return file_ops
+
+
+def _get_session_scoped_file_ops(task_id: str = "default"):
+    """Return descriptor-anchored operations when a Session Root is active."""
+    file_ops = _get_file_ops(task_id)
+    root = _session_file_root(task_id)
+    if root is None:
+        return file_ops
+    return _SessionRootFileOperations(root, file_ops)
 
 
 def clear_file_ops_cache(task_id: str = None):
@@ -1124,6 +2383,10 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
             })
 
         _resolved = _resolve_path_for_task(path, task_id)
+        if _session_file_root(task_id) is None:
+            hardlink_error = _session_root_hardlink_error(Path(_resolved), task_id)
+            if hardlink_error:
+                return tool_error(hardlink_error)
 
         # ── Structured-document extraction ────────────────────────────
         # Try before the binary-extension guard so .docx/.xlsx can render as text.
@@ -1132,19 +2395,33 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
 
         if is_extractable_document(str(_resolved)):
             try:
-                extracted_text = extract_document_text(str(_resolved))
+                file_ops = _get_session_scoped_file_ops(task_id)
+                if isinstance(file_ops, _SessionRootFileOperations):
+                    extracted_text, extracted_size = file_ops.extract_document(
+                        str(_resolved)
+                    )
+                else:
+                    extracted_text = extract_document_text(str(_resolved))
+                    extracted_size = os.path.getsize(_resolved)
             except ExtractionError:
                 logger.debug("document extraction failed for %s", path, exc_info=True)
             else:
-                file_ops = _get_file_ops(task_id)
                 lines = extracted_text.splitlines()
                 total_lines = len(lines)
                 end_line = offset + limit - 1
                 page_text = "\n".join(lines[offset - 1:end_line])
                 result_dict = {
-                    "content": file_ops._add_line_numbers(page_text, offset) if page_text else "",
+                    "content": (
+                        (
+                            file_ops.delegate
+                            if isinstance(file_ops, _SessionRootFileOperations)
+                            else file_ops
+                        )._add_line_numbers(page_text, offset)
+                        if page_text
+                        else ""
+                    ),
                     "total_lines": total_lines,
-                    "file_size": os.path.getsize(_resolved),
+                    "file_size": extracted_size,
                     "truncated": total_lines > end_line,
                     "extracted_document": True,
                 }
@@ -1267,8 +2544,9 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
                 pass  # stat failed — fall through to full read
 
         # ── Perform the read ──────────────────────────────────────────
-        file_ops = _get_file_ops(task_id)
-        result = file_ops.read_file(path, offset, limit)
+        file_ops = _get_session_scoped_file_ops(task_id)
+        file_ops_path = resolved_str if _session_file_root(task_id) is not None else path
+        result = file_ops.read_file(file_ops_path, offset, limit)
         result_dict = result.to_dict()
 
         # ── Character-count guard ─────────────────────────────────────
@@ -1599,6 +2877,8 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         # check below still runs.
         try:
             _resolved = str(_resolve_path_for_task(path, task_id))
+        except SessionRootPathError as exc:
+            return tool_error(str(exc))
         except Exception:
             _resolved = None
 
@@ -1618,6 +2898,10 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         # subagents can't interleave on the same file.  Different paths
         # remain fully parallel.
         with file_state.lock_path(_resolved):
+            if _session_file_root(task_id) is None:
+                hardlink_error = _session_root_hardlink_error(Path(_resolved), task_id)
+                if hardlink_error:
+                    return tool_error(hardlink_error)
             # Cross-agent staleness wins over per-task warning when both
             # fire — its message names the sibling subagent.
             cross_warning = file_state.check_stale(task_id, _resolved)
@@ -1625,7 +2909,7 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             # Workspace-divergence warning: relative path resolving outside the
             # terminal's cwd (the worktree-cwd bug). Lowest priority of the three.
             cwd_warning = _path_resolution_warning(path, Path(_resolved), task_id)
-            file_ops = _get_file_ops(task_id)
+            file_ops = _get_session_scoped_file_ops(task_id)
             result = file_ops.write_file(_resolved, content)
             result_dict = result.to_dict()
             effective_warning = cross_warning or stale_warning or cwd_warning
@@ -1650,6 +2934,34 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         else:
             logger.error("write_file error: %s: %s", type(e).__name__, e, exc_info=True)
         return tool_error(str(e))
+
+
+def _rewrite_v4a_patch_paths(
+    patch_content: str,
+    path_to_resolved: dict[str, str | None],
+) -> str:
+    """Rewrite V4A headers to the absolute paths already validated above."""
+    import re as _re
+
+    def _resolved(raw: str) -> str:
+        key = raw.strip()
+        return path_to_resolved.get(key) or key
+
+    rewritten = _re.sub(
+        r"^(\*\*\*\s*(?:Update|Add|Delete)\s+File:\s*)(.+?)\s*$",
+        lambda match: f"{match.group(1)}{_resolved(match.group(2))}",
+        patch_content,
+        flags=_re.MULTILINE,
+    )
+    return _re.sub(
+        r"^(\*\*\*\s*Move\s+File:\s*)(.+?)\s*->\s*(.+?)\s*$",
+        lambda match: (
+            f"{match.group(1)}{_resolved(match.group(2))} -> "
+            f"{_resolved(match.group(3))}"
+        ),
+        rewritten,
+        flags=_re.MULTILINE,
+    )
 
 
 def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
@@ -1724,6 +3036,8 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         for _p in _paths_to_check:
             try:
                 _r = str(_resolve_path_for_task(_p, task_id))
+            except SessionRootPathError as exc:
+                return tool_error(str(exc))
             except Exception:
                 _r = None
             if _r and _r not in _seen:
@@ -1746,9 +3060,15 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             for _p in _paths_to_check:
                 try:
                     _r = str(_resolve_path_for_task(_p, task_id))
+                except SessionRootPathError as exc:
+                    return tool_error(str(exc))
                 except Exception:
                     _r = None
                 _path_to_resolved[_p] = _r
+                if _r and _session_file_root(task_id) is None:
+                    hardlink_error = _session_root_hardlink_error(Path(_r), task_id)
+                    if hardlink_error:
+                        return tool_error(hardlink_error)
                 _cross = file_state.check_stale(task_id, _r) if _r else None
                 _sw = _cross or _check_file_staleness(_p, task_id)
                 if not _sw and _r:
@@ -1758,7 +3078,7 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 if _sw:
                     stale_warnings.append(_sw)
 
-            file_ops = _get_file_ops(task_id)
+            file_ops = _get_session_scoped_file_ops(task_id)
 
             if mode == "replace":
                 if not path:
@@ -1775,7 +3095,12 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             elif mode == "patch":
                 if not patch:
                     return tool_error("patch content required")
-                result = file_ops.patch_v4a(patch)
+                patch_payload = (
+                    _rewrite_v4a_patch_paths(patch, _path_to_resolved)
+                    if _session_file_root(task_id) is not None
+                    else patch
+                )
+                result = file_ops.patch_v4a(patch_payload)
             else:
                 return tool_error(f"Unknown mode: {mode}")
 
@@ -1853,6 +3178,17 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
     """Search for content or files."""
     try:
         offset, limit = normalize_search_pagination(offset, limit)
+        if _session_file_root(task_id) is not None:
+            if offset > _MAX_SESSION_SEARCH_OFFSET:
+                return tool_error(
+                    "Session Root search offset exceeds the "
+                    f"{_MAX_SESSION_SEARCH_OFFSET}-result pagination limit"
+                )
+            limit = min(limit, _MAX_SESSION_SEARCH_RESULTS)
+            context = min(
+                max(0, context),
+                _MAX_SESSION_SEARCH_CONTEXT,
+            )
 
         # Track searches to detect *consecutive* repeated search loops.
         # Include pagination args so users can page through truncated
@@ -1890,15 +3226,29 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
 
         try:
             resolved_path = _resolve_path_for_task(path, task_id)
+        except SessionRootPathError as exc:
+            return tool_error(str(exc))
         except (OSError, ValueError, RuntimeError):
             resolved_path = None
         block_error = get_read_block_error(str(resolved_path) if resolved_path else path)
         if block_error:
             return json.dumps({"error": block_error}, ensure_ascii=False)
+        if (
+            resolved_path is not None
+            and _session_file_root(task_id) is None
+        ):
+            tree_error = _session_root_tree_error(Path(resolved_path), task_id)
+            if tree_error:
+                return tool_error(tree_error)
 
-        file_ops = _get_file_ops(task_id)
+        file_ops = _get_session_scoped_file_ops(task_id)
+        file_ops_path = (
+            str(resolved_path)
+            if resolved_path is not None and _session_file_root(task_id) is not None
+            else path
+        )
         result = file_ops.search(
-            pattern=pattern, path=path, target=target, file_glob=file_glob,
+            pattern=pattern, path=file_ops_path, target=target, file_glob=file_glob,
             limit=limit, offset=offset, output_mode=output_mode, context=context
         )
         omitted = _filter_read_blocked_search_results(result, task_id)
@@ -2037,10 +3387,10 @@ SEARCH_FILES_SCHEMA = {
             "target": {"type": "string", "enum": ["content", "files"], "description": "'content' searches inside file contents, 'files' searches for files by name", "default": "content"},
             "path": {"type": "string", "description": "Directory or file to search in (default: current working directory)", "default": "."},
             "file_glob": {"type": "string", "description": "Filter files by pattern in grep mode (e.g., '*.py' to only search Python files)"},
-            "limit": {"type": "integer", "description": "Maximum number of results to return (default: 50)", "default": 50},
-            "offset": {"type": "integer", "description": "Skip first N results for pagination (default: 0)", "default": 0},
+            "limit": {"type": "integer", "description": "Maximum number of results to return (default: 50)", "default": 50, "minimum": 1, "maximum": 1000},
+            "offset": {"type": "integer", "description": "Skip first N results for pagination (default: 0)", "default": 0, "minimum": 0, "maximum": 10000},
             "output_mode": {"type": "string", "enum": ["content", "files_only", "count"], "description": "Output format for grep mode: 'content' shows matching lines with line numbers, 'files_only' lists file paths, 'count' shows match counts per file", "default": "content"},
-            "context": {"type": "integer", "description": "Number of context lines before and after each match (grep mode only)", "default": 0}
+            "context": {"type": "integer", "description": "Number of context lines before and after each match (grep mode only)", "default": 0, "minimum": 0, "maximum": 100}
         },
         "required": ["pattern"]
     }
