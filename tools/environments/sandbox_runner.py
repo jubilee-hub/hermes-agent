@@ -738,9 +738,13 @@ def run_sandbox_runner_isolation_canary(task_key: str) -> dict[str, bool]:
     except Exception:
         pass
     finally:
-        if mismatch is not None and mismatch_executed:
+        if mismatch is not None:
             try:
-                checks["mismatchOverlayRemoved"] = mismatch.delete_remote_overlay()
+                removed = mismatch.delete_remote_overlay()
+                # `removed=False` proves there was no durable overlay to clean.
+                # After a completed execution, however, the Runner must have
+                # created one and must report that it removed it.
+                checks["mismatchOverlayRemoved"] = removed or not mismatch_executed
             except Exception:
                 checks["mismatchOverlayRemoved"] = False
         if primary_key is not None and marker is not None:

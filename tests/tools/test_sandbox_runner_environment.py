@@ -329,6 +329,58 @@ def test_isolation_canary_fails_closed_without_runner_transport(monkeypatch):
     assert "private transport detail" not in json.dumps(checks)
 
 
+def test_isolation_canary_attempts_mismatch_cleanup_after_ambiguous_exec_failure(
+    monkeypatch,
+):
+    deleted: list[str] = []
+
+    class AmbiguousEnvironment:
+        @staticmethod
+        def _validate_task_key(task_key):
+            return SandboxRunnerEnvironment._validate_task_key(task_key)
+
+        def __init__(self, *, task_key, **_kwargs):
+            self.task_key = task_key
+
+        def execute(self, command, **_kwargs):
+            if self.task_key != TASK_KEY:
+                raise TimeoutError("response lost after possible overlay creation")
+            if "/usr/local/bin/python3 -I -S -P -" in command:
+                return {
+                    "returncode": 0,
+                    "output": "HERMES_SANDBOX_CANARY:"
+                    + json.dumps(
+                        {
+                            "workspaceBindingPresent": True,
+                            "workspaceWriteRead": True,
+                            "secretEnvDenied": True,
+                            "egressDenied": True,
+                        }
+                    ),
+                }
+            return {"returncode": 0, "output": ""}
+
+        def delete_remote_overlay(self):
+            deleted.append(self.task_key)
+            return True
+
+        def cleanup(self):
+            return None
+
+    monkeypatch.setattr(
+        sandbox_runner,
+        "SandboxRunnerEnvironment",
+        AmbiguousEnvironment,
+    )
+
+    checks = run_sandbox_runner_isolation_canary(TASK_KEY)
+
+    assert len(deleted) == 1
+    assert deleted[0] != TASK_KEY
+    assert checks["mismatchOverlayRemoved"] is True
+    assert checks["overlayMismatchDenied"] is False
+
+
 def test_artifact_export_uses_authenticated_uds_and_validates_the_task_bound_result(
     runner_fixture,
 ):
