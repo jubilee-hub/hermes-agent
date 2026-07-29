@@ -3418,7 +3418,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ),
                 status=503,
             )
-        if fork_status in {"source_missing", "source_ended"}:
+        if fork_status == "source_missing":
             return web.json_response(
                 _openai_error("Session is unavailable for fork", code="session_unavailable"),
                 status=409,

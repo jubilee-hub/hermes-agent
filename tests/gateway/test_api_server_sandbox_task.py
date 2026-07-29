@@ -623,6 +623,71 @@ def test_atomic_fork_loses_to_an_existing_sandbox_binding(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_optional_sandbox_forks_ended_unbound_session_without_rewriting_reason(
+    tmp_path,
+):
+    adapter = _adapter(tmp_path, required=False)
+    db = adapter._session_db
+    db.create_session("historical-source", "api_server")
+    db.append_message("historical-source", "user", "historical message")
+    db.end_session("historical-source", "api")
+    app = _app(adapter)
+
+    async with TestClient(TestServer(app)) as client:
+        response = await client.post(
+            "/api/sessions/historical-source/fork",
+            headers=AUTH,
+            json={"id": "historical-fork"},
+        )
+
+    assert response.status == 201
+    assert db.get_session("historical-source")["end_reason"] == "api"
+    fork = db.get_session("historical-fork")
+    assert fork["parent_session_id"] == "historical-source"
+    assert json.loads(fork["model_config"])["_branched_from"] == "historical-source"
+    assert db.get_messages("historical-fork")[0]["content"] == "historical message"
+
+
+def test_explicit_fork_strips_delegate_lineage(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("root", "api_server")
+    db.create_session(
+        "delegate-source",
+        "api_server",
+        parent_session_id="root",
+        model_config={"temperature": 0.2, "_delegate_from": "root"},
+    )
+
+    assert db.fork_session_if_unbound("delegate-source", "explicit-fork") == "created"
+    model_config = json.loads(db.get_session("explicit-fork")["model_config"])
+    assert model_config == {
+        "temperature": 0.2,
+        "_branched_from": "delegate-source",
+    }
+
+
+def test_compression_child_inherits_parent_sandbox_binding_at_insert(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    context_hash = "sha256:" + ("a" * 64)
+    db.create_session("sandbox-parent", "api_server")
+    assert db.bind_sandbox_context("sandbox-parent", context_hash)
+    db.end_session("sandbox-parent", "compression")
+
+    db.create_session(
+        "compression-child",
+        "api_server",
+        parent_session_id="sandbox-parent",
+    )
+
+    assert db.get_session("compression-child")["sandbox_context_hash"] == context_hash
+    assert (
+        db.fork_session_if_unbound("compression-child", "escaped-fork")
+        == "source_sandbox_bound"
+    )
+    assert db.get_session("escaped-fork") is None
+
+
+@pytest.mark.asyncio
 async def test_responses_previous_response_rejects_a_different_sandbox(tmp_path):
     adapter = _adapter(tmp_path)
     calls = []
