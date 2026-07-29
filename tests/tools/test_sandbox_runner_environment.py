@@ -60,6 +60,8 @@ class _ThreadedUnixHTTPServer(
         self.disconnect_observed = threading.Event()
         self.block_response = False
         self.health_delay_seconds = 0.0
+        self.capabilities_delay_seconds = 0.0
+        self.get_requests: list[dict[str, object]] = []
         self.capabilities: dict[str, object] = {
             "schemaVersion": 1,
             "runnerInstanceId": "sandbox-runner-v1-" + ("a" * 32),
@@ -113,6 +115,10 @@ class _RunnerHandler(BaseHTTPRequestHandler):
             self.server.disconnect_observed.set()
 
     def do_GET(self):
+        self.server.get_requests.append({
+            "path": self.path,
+            "authorization": self.headers.get("authorization"),
+        })
         if self.path == "/health":
             time.sleep(self.server.health_delay_seconds)
             payload = {
@@ -126,6 +132,7 @@ class _RunnerHandler(BaseHTTPRequestHandler):
             self.path == "/v1/capabilities"
             and self.headers.get("authorization") == f"Bearer {TOKEN}"
         ):
+            time.sleep(self.server.capabilities_delay_seconds)
             payload = self.server.capabilities
             status_code = 200
         else:
@@ -709,6 +716,12 @@ def test_live_readiness_requires_the_exact_artifact_export_policy(
     )
 
     assert sandbox_runner_ready_from_environment() is True
+    assert server.get_requests == [
+        {
+            "path": "/v1/capabilities",
+            "authorization": f"Bearer {TOKEN}",
+        }
+    ]
     artifact_export = server.capabilities["artifactExport"]
     assert isinstance(artifact_export, dict)
     artifact_export["pathPolicy"] = "unsafe_follow"
@@ -737,9 +750,6 @@ def test_live_identity_returns_only_the_validated_runner_fingerprint(
     server.capabilities["runnerInstanceId"] = "pid-123"
     assert sandbox_runner_identity_from_environment() is None
     server.capabilities["runnerInstanceId"] = "sandbox-runner-v1-" + ("a" * 32)
-    server.health_runner_instance_id = "sandbox-runner-v1-" + ("b" * 32)
-    assert sandbox_runner_identity_from_environment() is None
-    server.health_runner_instance_id = server.capabilities["runnerInstanceId"]
     server.capabilities["imageFingerprint"] = "/host/image.sif"
     assert sandbox_runner_ready_from_environment() is False
     assert sandbox_runner_identity_from_environment() is None
@@ -799,7 +809,7 @@ def test_live_readiness_allows_a_bounded_slow_host_probe(
     monkeypatch,
 ):
     server, socket_path, token_fd = runner_fixture
-    server.health_delay_seconds = 2.1
+    server.capabilities_delay_seconds = 2.1
     monkeypatch.setenv("HERMES_SANDBOX_RUNNER_SOCKET_PATH", str(socket_path))
     monkeypatch.setenv("HERMES_SANDBOX_RUNNER_TOKEN_FD", str(token_fd))
     monkeypatch.setattr(
@@ -816,7 +826,7 @@ def test_live_readiness_still_fails_closed_after_its_bounded_timeout(
     monkeypatch,
 ):
     server, socket_path, token_fd = runner_fixture
-    server.health_delay_seconds = 0.2
+    server.capabilities_delay_seconds = 0.2
     monkeypatch.setenv("HERMES_SANDBOX_RUNNER_SOCKET_PATH", str(socket_path))
     monkeypatch.setenv("HERMES_SANDBOX_RUNNER_TOKEN_FD", str(token_fd))
     monkeypatch.setattr(
