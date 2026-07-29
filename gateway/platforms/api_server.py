@@ -950,6 +950,7 @@ def _admit_api_agent_request(handler):
                 "_handle_chat_completions",
                 "_handle_responses",
                 "_handle_dedicated_sandbox_canary",
+                "_handle_dedicated_sandbox_identity",
             }
         ):
             return web.json_response(
@@ -1221,6 +1222,10 @@ class APIServerAdapter(BasePlatformAdapter):
             extra.get("sandbox_task_key_required"),
             default=False,
         )
+        # Process-local, non-secret generation identity. A same-image gateway
+        # restart receives a new value, allowing the SaaS control plane to
+        # detect a restart between its behavioral canary and evidence write.
+        self._runtime_instance_id: str = f"hermes-runtime-v1-{uuid.uuid4().hex}"
         self._cors_origins: tuple[str, ...] = self._parse_cors_origins(
             extra.get("cors_origins", os.getenv("API_SERVER_CORS_ORIGINS", "")),
         )
@@ -1761,6 +1766,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/capabilities", self._handle_capabilities),
             ("POST", "/v1/session-root-canary", self._handle_session_root_canary),
             ("POST", "/v1/dedicated-sandbox-canary", self._handle_dedicated_sandbox_canary),
+            ("POST", "/v1/dedicated-sandbox-identity", self._handle_dedicated_sandbox_identity),
             ("GET", "/v1/workspace/files", self._handle_workspace_files),
             ("GET", "/v1/workspace/file", self._handle_workspace_file),
             ("GET", "/v1/skills", self._handle_skills),
@@ -2386,16 +2392,93 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         from tools.environments.sandbox_runner import (
             run_sandbox_runner_isolation_canary,
+            sandbox_runner_identity_from_environment,
         )
 
+        identity_before = await asyncio.to_thread(
+            sandbox_runner_identity_from_environment,
+        )
+        if identity_before is None:
+            return web.json_response(
+                _openai_error(
+                    "Sandbox Runner identity is unavailable.",
+                    code="sandbox_runner_identity_unavailable",
+                ),
+                status=503,
+            )
         checks = await asyncio.to_thread(
             run_sandbox_runner_isolation_canary,
             sandbox_task_key,
         )
+        identity_after = await asyncio.to_thread(
+            sandbox_runner_identity_from_environment,
+        )
+        if identity_after is None:
+            return web.json_response(
+                _openai_error(
+                    "Sandbox Runner identity is unavailable.",
+                    code="sandbox_runner_identity_unavailable",
+                ),
+                status=503,
+            )
+        if (
+            identity_before["runnerInstanceId"]
+            != identity_after["runnerInstanceId"]
+            or identity_before["imageFingerprint"]
+            != identity_after["imageFingerprint"]
+        ):
+            return web.json_response(
+                _openai_error(
+                    "Sandbox Runner identity changed during canary.",
+                    code="sandbox_runner_identity_changed_during_canary",
+                ),
+                status=503,
+            )
         return web.json_response(
             {
                 "source": "hermes.sandbox_runner_canary",
+                "runtimeInstanceId": self._runtime_instance_id,
+                "runnerInstanceId": identity_after["runnerInstanceId"],
+                "runnerImageFingerprint": identity_after["imageFingerprint"],
                 "checks": checks,
+            }
+        )
+
+    @_admit_api_agent_request
+    async def _handle_dedicated_sandbox_identity(
+        self,
+        request: "web.Request",
+    ) -> "web.Response":
+        """Return the live gateway generation and readiness-verified SIF hash."""
+        if not self._sandbox_task_key_required:
+            return web.json_response(
+                _openai_error(
+                    "Dedicated sandbox identity is unavailable.",
+                    code="sandbox_runner_not_configured",
+                ),
+                status=503,
+            )
+        from tools.environments.sandbox_runner import (
+            sandbox_runner_identity_from_environment,
+        )
+
+        identity = await asyncio.to_thread(
+            sandbox_runner_identity_from_environment,
+        )
+        if identity is None:
+            return web.json_response(
+                _openai_error(
+                    "Sandbox Runner identity is unavailable.",
+                    code="sandbox_runner_identity_unavailable",
+                ),
+                status=503,
+            )
+        return web.json_response(
+            {
+                "source": "hermes.sandbox_runner_identity",
+                "runtimeInstanceId": self._runtime_instance_id,
+                "runnerInstanceId": identity["runnerInstanceId"],
+                "runnerImageFingerprint": identity["imageFingerprint"],
             }
         )
 
@@ -2794,6 +2877,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "sandbox_task_supported_endpoints": [
                     "/v1/chat/completions",
                     "/v1/dedicated-sandbox-canary",
+                    "/v1/dedicated-sandbox-identity",
                     "/v1/responses",
                 ],
                 "session_root_header": (
@@ -2809,6 +2893,20 @@ class APIServerAdapter(BasePlatformAdapter):
                 "models": {"method": "GET", "path": "/v1/models"},
                 "chat_completions": {"method": "POST", "path": "/v1/chat/completions"},
                 "responses": {"method": "POST", "path": "/v1/responses"},
+                **(
+                    {
+                        "dedicated_sandbox_canary": {
+                            "method": "POST",
+                            "path": "/v1/dedicated-sandbox-canary",
+                        },
+                        "dedicated_sandbox_identity": {
+                            "method": "POST",
+                            "path": "/v1/dedicated-sandbox-identity",
+                        },
+                    }
+                    if self._sandbox_task_key_required
+                    else {}
+                ),
                 "runs": {"method": "POST", "path": "/v1/runs"},
                 "run_status": {"method": "GET", "path": "/v1/runs/{run_id}"},
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},

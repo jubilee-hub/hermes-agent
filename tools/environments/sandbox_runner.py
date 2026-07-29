@@ -26,6 +26,8 @@ from tools.environments.base import BaseEnvironment, _ThreadedProcessHandle
 DEFAULT_SOCKET_PATH = "/run/agent-saas-sandbox-runner/runner.sock"
 DEFAULT_TOKEN_FD = 8
 _TASK_KEY_RE = re.compile(r"^sandbox-v1-[A-Za-z0-9_-]{43}$")
+_IMAGE_FINGERPRINT_RE = re.compile(r"^sha256:[a-f0-9]{64}$")
+_RUNNER_INSTANCE_ID_RE = re.compile(r"^sandbox-runner-v1-[a-f0-9]{32}$")
 _MAX_COMMAND_CHARS = 65_536
 _MAX_STDIN_CHARS = 1_048_576
 _MAX_OUTPUT_BYTES = 1_048_576
@@ -904,6 +906,40 @@ def sandbox_runner_ready_from_environment() -> bool:
     to ``False`` so transport or credential details never enter an HTTP body or
     log message.
     """
+    state = _sandbox_runner_live_state_from_environment()
+    if state is None:
+        return False
+    return _sandbox_runner_live_policy_ready(*state)
+
+
+def sandbox_runner_identity_from_environment() -> dict[str, str] | None:
+    """Return the live, readiness-verified Runner generation and SIF fingerprint.
+
+    The unauthenticated health probe recomputes the configured SIF digest before
+    reporting ready, while the authenticated capabilities response carries the
+    bounded fingerprint. Returning no paths or transport details keeps this safe
+    for the API-server's control-plane identity endpoint.
+    """
+    state = _sandbox_runner_live_state_from_environment()
+    if state is None or not _sandbox_runner_live_policy_ready(*state):
+        return None
+    fingerprint = state[1].get("imageFingerprint")
+    runner_instance_id = state[1].get("runnerInstanceId")
+    if not isinstance(fingerprint, str) or not _IMAGE_FINGERPRINT_RE.fullmatch(
+        fingerprint
+    ):
+        return None
+    if not isinstance(runner_instance_id, str) or not _RUNNER_INSTANCE_ID_RE.fullmatch(
+        runner_instance_id
+    ):
+        return None
+    return {
+        "runnerInstanceId": runner_instance_id,
+        "imageFingerprint": fingerprint,
+    }
+
+
+def _sandbox_runner_live_state_from_environment() -> tuple[dict, dict] | None:
     try:
         raw_token_fd = os.getenv(
             "HERMES_SANDBOX_RUNNER_TOKEN_FD",
@@ -936,23 +972,34 @@ def sandbox_runner_ready_from_environment() -> bool:
             path="/v1/capabilities",
             token=token,
         )
-        return (
-            health.get("schemaVersion") == 1
-            and health.get("status") == "ready"
-            and isinstance(health.get("checks"), dict)
-            and capabilities.get("schemaVersion") == 1
-            and capabilities.get("isolation") == "per_task_overlay"
-            and capabilities.get("network") == "disabled"
-            and capabilities.get("artifactExport")
-            == {
-                "outbox": "/workspace/artifacts",
-                "pathPolicy": "plain_filename_no_follow",
-                "maxBytes": _MAX_ARTIFACT_BYTES,
-            }
-            and isinstance(capabilities.get("limits"), dict)
-        )
+        return health, capabilities
     except Exception:
-        return False
+        return None
+
+
+def _sandbox_runner_live_policy_ready(health: dict, capabilities: dict) -> bool:
+    return (
+        health.get("schemaVersion") == 1
+        and health.get("status") == "ready"
+        and isinstance(health.get("checks"), dict)
+        and isinstance(health.get("runnerInstanceId"), str)
+        and bool(_RUNNER_INSTANCE_ID_RE.fullmatch(health["runnerInstanceId"]))
+        and capabilities.get("schemaVersion") == 1
+        and isinstance(capabilities.get("runnerInstanceId"), str)
+        and bool(
+            _RUNNER_INSTANCE_ID_RE.fullmatch(capabilities["runnerInstanceId"])
+        )
+        and health.get("runnerInstanceId") == capabilities.get("runnerInstanceId")
+        and capabilities.get("isolation") == "per_task_overlay"
+        and capabilities.get("network") == "disabled"
+        and capabilities.get("artifactExport")
+        == {
+            "outbox": "/workspace/artifacts",
+            "pathPolicy": "plain_filename_no_follow",
+            "maxBytes": _MAX_ARTIFACT_BYTES,
+        }
+        and isinstance(capabilities.get("limits"), dict)
+    )
 
 
 def _runner_probe_json(

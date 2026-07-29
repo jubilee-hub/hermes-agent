@@ -19,6 +19,8 @@ from hermes_state import SessionDB
 AUTH = {"Authorization": "Bearer sk-test"}
 SANDBOX_A = "sandbox-v1-" + ("A" * 43)
 SANDBOX_B = "sandbox-v1-" + ("B" * 43)
+RUNNER_INSTANCE_A = "sandbox-runner-v1-" + ("a" * 32)
+RUNNER_INSTANCE_B = "sandbox-runner-v1-" + ("b" * 32)
 
 
 def _execution_task_id(key):
@@ -51,6 +53,10 @@ def _app(adapter):
     app.router.add_post(
         "/v1/dedicated-sandbox-canary",
         adapter._handle_dedicated_sandbox_canary,
+    )
+    app.router.add_post(
+        "/v1/dedicated-sandbox-identity",
+        adapter._handle_dedicated_sandbox_identity,
     )
     app.router.add_post("/v1/runs", adapter._handle_runs)
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
@@ -160,7 +166,19 @@ async def test_dedicated_canary_requires_auth_and_uses_only_header_task_identity
     with patch(
         "tools.environments.sandbox_runner.run_sandbox_runner_isolation_canary",
         return_value=checks,
-    ) as canary:
+    ) as canary, patch(
+        "tools.environments.sandbox_runner.sandbox_runner_identity_from_environment",
+        side_effect=[
+            {
+                "runnerInstanceId": RUNNER_INSTANCE_A,
+                "imageFingerprint": "sha256:" + ("a" * 64),
+            },
+            {
+                "runnerInstanceId": RUNNER_INSTANCE_A,
+                "imageFingerprint": "sha256:" + ("a" * 64),
+            },
+        ],
+    ) as identity:
         async with TestClient(TestServer(app)) as client:
             unauthenticated = await client.post(
                 "/v1/dedicated-sandbox-canary",
@@ -184,9 +202,202 @@ async def test_dedicated_canary_requires_auth_and_uses_only_header_task_identity
     assert response.status == 200
     assert payload == {
         "source": "hermes.sandbox_runner_canary",
+        "runtimeInstanceId": adapter._runtime_instance_id,
+        "runnerInstanceId": RUNNER_INSTANCE_A,
+        "runnerImageFingerprint": "sha256:" + ("a" * 64),
         "checks": checks,
     }
     canary.assert_called_once_with(SANDBOX_A)
+    assert identity.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_dedicated_canary_fails_closed_when_runner_identity_changes(tmp_path):
+    adapter = _adapter(tmp_path)
+    checks = {"workspaceWriteRead": True}
+    app = _app(adapter)
+
+    with patch(
+        "tools.environments.sandbox_runner.run_sandbox_runner_isolation_canary",
+        return_value=checks,
+    ) as canary, patch(
+        "tools.environments.sandbox_runner.sandbox_runner_identity_from_environment",
+        side_effect=[
+            {
+                "runnerInstanceId": RUNNER_INSTANCE_A,
+                "imageFingerprint": "sha256:" + ("a" * 64),
+            },
+            {
+                "runnerInstanceId": RUNNER_INSTANCE_A,
+                "imageFingerprint": "sha256:" + ("b" * 64),
+            },
+        ],
+    ):
+        async with TestClient(TestServer(app)) as client:
+            response = await client.post(
+                "/v1/dedicated-sandbox-canary",
+                headers={**AUTH, "X-Hermes-Sandbox-Task-Key": SANDBOX_A},
+                json={},
+            )
+            payload = await response.json()
+
+    assert response.status == 503
+    assert payload["error"]["code"] == "sandbox_runner_identity_changed_during_canary"
+    canary.assert_called_once_with(SANDBOX_A)
+
+
+@pytest.mark.asyncio
+async def test_dedicated_canary_fails_closed_when_runner_restarts_with_same_sif(
+    tmp_path,
+):
+    adapter = _adapter(tmp_path)
+    app = _app(adapter)
+    fingerprint = "sha256:" + ("a" * 64)
+
+    with patch(
+        "tools.environments.sandbox_runner.run_sandbox_runner_isolation_canary",
+        return_value={"workspaceWriteRead": True},
+    ), patch(
+        "tools.environments.sandbox_runner.sandbox_runner_identity_from_environment",
+        side_effect=[
+            {
+                "runnerInstanceId": RUNNER_INSTANCE_A,
+                "imageFingerprint": fingerprint,
+            },
+            {
+                "runnerInstanceId": RUNNER_INSTANCE_B,
+                "imageFingerprint": fingerprint,
+            },
+        ],
+    ):
+        async with TestClient(TestServer(app)) as client:
+            response = await client.post(
+                "/v1/dedicated-sandbox-canary",
+                headers={**AUTH, "X-Hermes-Sandbox-Task-Key": SANDBOX_A},
+                json={},
+            )
+            payload = await response.json()
+
+    assert response.status == 503
+    assert payload["error"]["code"] == "sandbox_runner_identity_changed_during_canary"
+
+
+@pytest.mark.asyncio
+async def test_dedicated_canary_does_not_run_without_initial_runner_identity(tmp_path):
+    adapter = _adapter(tmp_path)
+    app = _app(adapter)
+
+    with patch(
+        "tools.environments.sandbox_runner.run_sandbox_runner_isolation_canary",
+    ) as canary, patch(
+        "tools.environments.sandbox_runner.sandbox_runner_identity_from_environment",
+        return_value=None,
+    ):
+        async with TestClient(TestServer(app)) as client:
+            response = await client.post(
+                "/v1/dedicated-sandbox-canary",
+                headers={**AUTH, "X-Hermes-Sandbox-Task-Key": SANDBOX_A},
+                json={},
+            )
+            payload = await response.json()
+
+    assert response.status == 503
+    assert payload["error"]["code"] == "sandbox_runner_identity_unavailable"
+    canary.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_dedicated_identity_is_stable_per_process_and_requires_live_runner(
+    tmp_path,
+):
+    adapter = _adapter(tmp_path)
+    restarted_path = tmp_path / "restarted"
+    restarted_path.mkdir()
+    restarted_adapter = _adapter(restarted_path)
+    app = _app(adapter)
+    runner_fingerprint = "sha256:" + ("b" * 64)
+
+    with patch(
+        "tools.environments.sandbox_runner.sandbox_runner_identity_from_environment",
+        side_effect=[
+            {
+                "runnerInstanceId": RUNNER_INSTANCE_A,
+                "imageFingerprint": runner_fingerprint,
+            },
+            {
+                "runnerInstanceId": RUNNER_INSTANCE_A,
+                "imageFingerprint": runner_fingerprint,
+            },
+            None,
+        ],
+    ):
+        async with TestClient(TestServer(app)) as client:
+            unauthenticated = await client.post(
+                "/v1/dedicated-sandbox-identity",
+                headers={"X-Hermes-Sandbox-Task-Key": SANDBOX_A},
+                json={},
+            )
+            missing_task_key = await client.post(
+                "/v1/dedicated-sandbox-identity",
+                headers=AUTH,
+                json={},
+            )
+            first = await client.post(
+                "/v1/dedicated-sandbox-identity",
+                headers={**AUTH, "X-Hermes-Sandbox-Task-Key": SANDBOX_A},
+                json={},
+            )
+            second = await client.post(
+                "/v1/dedicated-sandbox-identity",
+                headers={**AUTH, "X-Hermes-Sandbox-Task-Key": SANDBOX_A},
+                json={},
+            )
+            unavailable = await client.post(
+                "/v1/dedicated-sandbox-identity",
+                headers={**AUTH, "X-Hermes-Sandbox-Task-Key": SANDBOX_A},
+                json={},
+            )
+            first_payload = await first.json()
+            second_payload = await second.json()
+
+    assert unauthenticated.status == 401
+    assert missing_task_key.status == 400
+    assert first.status == 200
+    assert second.status == 200
+    assert first_payload == second_payload == {
+        "source": "hermes.sandbox_runner_identity",
+        "runtimeInstanceId": adapter._runtime_instance_id,
+        "runnerInstanceId": RUNNER_INSTANCE_A,
+        "runnerImageFingerprint": runner_fingerprint,
+    }
+    assert restarted_adapter._runtime_instance_id != adapter._runtime_instance_id
+    assert unavailable.status == 503
+
+
+@pytest.mark.asyncio
+async def test_dedicated_canary_fails_closed_when_live_runner_identity_is_missing(
+    tmp_path,
+):
+    adapter = _adapter(tmp_path)
+    app = _app(adapter)
+
+    with patch(
+        "tools.environments.sandbox_runner.run_sandbox_runner_isolation_canary",
+        return_value={"sandboxTaskKeyHeaderAccepted": True},
+    ), patch(
+        "tools.environments.sandbox_runner.sandbox_runner_identity_from_environment",
+        return_value=None,
+    ):
+        async with TestClient(TestServer(app)) as client:
+            response = await client.post(
+                "/v1/dedicated-sandbox-canary",
+                headers={**AUTH, "X-Hermes-Sandbox-Task-Key": SANDBOX_A},
+                json={},
+            )
+            payload = await response.json()
+
+    assert response.status == 503
+    assert payload["error"]["code"] == "sandbox_runner_identity_unavailable"
 
 
 @pytest.mark.asyncio
@@ -631,6 +842,23 @@ async def test_capabilities_advertise_controlled_sandbox_contract(tmp_path):
         "X-Hermes-Sandbox-Task-Key"
     )
     assert body["features"]["sandbox_task_key_required"] is True
+    supported_endpoints = set(body["features"]["sandbox_task_supported_endpoints"])
+    # This is a security allowlist, not a catalog snapshot: adding any agent
+    # endpoint requires an explicit identity-bridge review and test update.
+    assert supported_endpoints == {
+        "/v1/chat/completions",
+        "/v1/dedicated-sandbox-canary",
+        "/v1/dedicated-sandbox-identity",
+        "/v1/responses",
+    }
+    assert body["endpoints"]["dedicated_sandbox_canary"] == {
+        "method": "POST",
+        "path": "/v1/dedicated-sandbox-canary",
+    }
+    assert body["endpoints"]["dedicated_sandbox_identity"] == {
+        "method": "POST",
+        "path": "/v1/dedicated-sandbox-identity",
+    }
     assert body["features"]["run_submission"] is False
     assert body["features"]["session_chat"] is False
 
