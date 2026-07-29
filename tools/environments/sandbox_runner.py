@@ -926,25 +926,24 @@ def sandbox_runner_ready_from_environment() -> bool:
     to ``False`` so transport or credential details never enter an HTTP body or
     log message.
     """
-    state = _sandbox_runner_live_state_from_environment()
-    if state is None:
+    capabilities = _sandbox_runner_live_capabilities_from_environment()
+    if capabilities is None:
         return False
-    return _sandbox_runner_live_policy_ready(*state)
+    return _sandbox_runner_live_policy_ready(capabilities)
 
 
 def sandbox_runner_identity_from_environment() -> dict[str, str] | None:
     """Return the live, readiness-verified Runner generation and SIF fingerprint.
 
-    The unauthenticated health probe recomputes the configured SIF digest before
-    reporting ready, while the authenticated capabilities response carries the
-    bounded fingerprint. Returning no paths or transport details keeps this safe
-    for the API-server's control-plane identity endpoint.
+    The authenticated capabilities request performs the Runner readiness probe
+    before returning the bounded fingerprint. Returning no paths or transport
+    details keeps this safe for the API-server's control-plane identity endpoint.
     """
-    state = _sandbox_runner_live_state_from_environment()
-    if state is None or not _sandbox_runner_live_policy_ready(*state):
+    capabilities = _sandbox_runner_live_capabilities_from_environment()
+    if capabilities is None or not _sandbox_runner_live_policy_ready(capabilities):
         return None
-    fingerprint = state[1].get("imageFingerprint")
-    runner_instance_id = state[1].get("runnerInstanceId")
+    fingerprint = capabilities.get("imageFingerprint")
+    runner_instance_id = capabilities.get("runnerInstanceId")
     if not isinstance(fingerprint, str) or not _IMAGE_FINGERPRINT_RE.fullmatch(
         fingerprint
     ):
@@ -959,7 +958,7 @@ def sandbox_runner_identity_from_environment() -> dict[str, str] | None:
     }
 
 
-def _sandbox_runner_live_state_from_environment() -> tuple[dict, dict] | None:
+def _sandbox_runner_live_capabilities_from_environment() -> dict | None:
     try:
         raw_token_fd = os.getenv(
             "HERMES_SANDBOX_RUNNER_TOKEN_FD",
@@ -982,34 +981,22 @@ def _sandbox_runner_live_state_from_environment() -> tuple[dict, dict] | None:
         probe._assert_socket_ready()
         token = probe._read_token()
 
-        health = _runner_probe_json(
-            socket_path=probe._socket_path,
-            path="/health",
-            token=None,
-        )
-        capabilities = _runner_probe_json(
+        return _runner_probe_json(
             socket_path=probe._socket_path,
             path="/v1/capabilities",
             token=token,
         )
-        return health, capabilities
     except Exception:
         return None
 
 
-def _sandbox_runner_live_policy_ready(health: dict, capabilities: dict) -> bool:
+def _sandbox_runner_live_policy_ready(capabilities: dict) -> bool:
     return (
-        health.get("schemaVersion") == 1
-        and health.get("status") == "ready"
-        and isinstance(health.get("checks"), dict)
-        and isinstance(health.get("runnerInstanceId"), str)
-        and bool(_RUNNER_INSTANCE_ID_RE.fullmatch(health["runnerInstanceId"]))
-        and capabilities.get("schemaVersion") == 1
+        capabilities.get("schemaVersion") == 1
         and isinstance(capabilities.get("runnerInstanceId"), str)
         and bool(
             _RUNNER_INSTANCE_ID_RE.fullmatch(capabilities["runnerInstanceId"])
         )
-        and health.get("runnerInstanceId") == capabilities.get("runnerInstanceId")
         and capabilities.get("isolation") == "per_task_overlay"
         and capabilities.get("network") == "disabled"
         and isinstance(capabilities.get("imageFingerprint"), str)

@@ -29,6 +29,7 @@ COPY --chown=root:root --chmod=0444 gateway/session_context.py /opt/hermes/gatew
 COPY --chown=root:root --chmod=0444 gateway/platforms/api_server.py /opt/hermes/gateway/platforms/api_server.py
 COPY --chown=root:root --chmod=0444 tools/file_tools.py /opt/hermes/tools/file_tools.py
 COPY --chown=root:root --chmod=0444 tools/terminal_tool.py /opt/hermes/tools/terminal_tool.py
+COPY --chown=root:root --chmod=0444 tools/code_execution_tool.py /opt/hermes/tools/code_execution_tool.py
 COPY --chown=root:root --chmod=0444 tools/environments/sandbox_runner.py /opt/hermes/tools/environments/sandbox_runner.py
 COPY --chown=root:root --chmod=0555 scripts/sandbox_runner_live_e2e.py /opt/hermes/scripts/sandbox_runner_live_e2e.py
 COPY --chown=root:root --chmod=0555 docker/agent-saas-workspace-perms.sh /etc/cont-init.d/03-agent-saas-workspace-perms
