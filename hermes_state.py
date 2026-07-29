@@ -1976,9 +1976,11 @@ class SessionDB:
             conn.execute(
                 """INSERT INTO sessions (
                    id, source, user_id, session_key, chat_id, chat_type, thread_id,
-                   model, model_config, system_prompt, parent_session_id, cwd, profile_name, started_at
+                   model, model_config, system_prompt, parent_session_id, cwd,
+                   profile_name, sandbox_context_hash, started_at
                 )
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                           (SELECT sandbox_context_hash FROM sessions WHERE id = ?), ?)
                    ON CONFLICT(id) DO UPDATE SET
                        model = COALESCE(sessions.model, excluded.model),
                        model_config = COALESCE(sessions.model_config, excluded.model_config),
@@ -1989,7 +1991,11 @@ class SessionDB:
                        thread_id = COALESCE(sessions.thread_id, excluded.thread_id),
                        parent_session_id = COALESCE(sessions.parent_session_id, excluded.parent_session_id),
                        cwd = COALESCE(sessions.cwd, excluded.cwd),
-                       profile_name = COALESCE(sessions.profile_name, excluded.profile_name)""",
+                       profile_name = COALESCE(sessions.profile_name, excluded.profile_name),
+                       sandbox_context_hash = COALESCE(
+                           sessions.sandbox_context_hash,
+                           excluded.sandbox_context_hash
+                       )""",
                 (
                     session_id,
                     source,
@@ -2004,6 +2010,7 @@ class SessionDB:
                     parent_session_id,
                     cwd,
                     profile_name,
+                    parent_session_id,
                     time.time(),
                 ),
             )
@@ -3298,6 +3305,101 @@ class SessionDB:
             )
 
         return bool(self._execute_write(_do))
+
+    def fork_session_if_unbound(
+        self,
+        source_id: str,
+        fork_id: str,
+    ) -> str:
+        """Atomically fork only a session that has no sandbox binding.
+
+        The source check, source termination, child creation, and transcript
+        copy share one write transaction. This prevents a concurrent sandbox
+        request from binding the source between a preflight read and the copy.
+
+        Returns one of ``created``, ``source_missing``,
+        ``source_sandbox_bound``, or ``fork_exists``.
+        """
+
+        def _do(conn: sqlite3.Connection) -> str:
+            source = conn.execute(
+                "SELECT * FROM sessions WHERE id = ?",
+                (source_id,),
+            ).fetchone()
+            if source is None:
+                return "source_missing"
+            if source["sandbox_context_hash"] is not None:
+                return "source_sandbox_bound"
+            if conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ?",
+                (fork_id,),
+            ).fetchone():
+                return "fork_exists"
+
+            messages = [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM messages "
+                    "WHERE session_id = ? AND active = 1 ORDER BY id",
+                    (source_id,),
+                ).fetchall()
+            ]
+            for message in messages:
+                message["content"] = self._decode_content(message.get("content"))
+                for field in (
+                    "tool_calls",
+                    "reasoning_details",
+                    "codex_reasoning_items",
+                    "codex_message_items",
+                ):
+                    value = message.get(field)
+                    if isinstance(value, str):
+                        try:
+                            message[field] = json.loads(value)
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+
+            if source["ended_at"] is None:
+                conn.execute(
+                    "UPDATE sessions SET ended_at = ?, end_reason = 'branched' "
+                    "WHERE id = ?",
+                    (time.time(), source_id),
+                )
+            try:
+                model_config = json.loads(source["model_config"] or "{}")
+            except (json.JSONDecodeError, TypeError):
+                model_config = {}
+            if not isinstance(model_config, dict):
+                model_config = {}
+            model_config.pop("_delegate_from", None)
+            model_config["_branched_from"] = source_id
+            conn.execute(
+                """INSERT INTO sessions (
+                       id, source, model, model_config, system_prompt,
+                       parent_session_id, started_at
+                   ) VALUES (?, 'api_server', ?, ?, ?, ?, ?)""",
+                (
+                    fork_id,
+                    source["model"],
+                    json.dumps(model_config),
+                    source["system_prompt"],
+                    source_id,
+                    time.time(),
+                ),
+            )
+            message_count, tool_call_count = self._insert_message_rows(
+                conn,
+                fork_id,
+                messages,
+            )
+            conn.execute(
+                "UPDATE sessions SET message_count = ?, tool_call_count = ? "
+                "WHERE id = ?",
+                (message_count, tool_call_count, fork_id),
+            )
+            return "created"
+
+        return self._execute_write(_do)
 
     def resolve_session_id(self, session_id_or_prefix: str) -> Optional[str]:
         """Resolve an exact or uniquely prefixed session ID to the full ID.

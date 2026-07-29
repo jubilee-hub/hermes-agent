@@ -24,6 +24,7 @@ LABEL org.opencontainers.image.source="https://github.com/jubilee-hub/hermes-age
 # required by the Agent SaaS compatibility contract are overlaid. Everything
 # else remains byte-for-byte from the pinned official image.
 COPY --chown=root:root --chmod=0444 agent/runtime_cwd.py /opt/hermes/agent/runtime_cwd.py
+COPY --chown=root:root --chmod=0444 hermes_state.py /opt/hermes/hermes_state.py
 COPY --chown=root:root --chmod=0444 gateway/session_context.py /opt/hermes/gateway/session_context.py
 COPY --chown=root:root --chmod=0444 gateway/platforms/api_server.py /opt/hermes/gateway/platforms/api_server.py
 COPY --chown=root:root --chmod=0444 tools/file_tools.py /opt/hermes/tools/file_tools.py
