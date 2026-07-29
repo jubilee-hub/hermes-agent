@@ -31,6 +31,11 @@ class Lifecycle:
         return None
 
 probe._environment = lambda _task_key: Lifecycle()
+probe._identity_snapshot = lambda _task_key: (
+    "hermes-runtime-v1-" + ("a" * 32),
+    "sandbox-runner-v1-" + ("b" * 32),
+    "sha256:" + ("c" * 64),
+)
 probe.run_sandbox_runner_isolation_canary = lambda _task_key: {
     name: False for name in probe.SANDBOX_RUNNER_CANARY_CHECKS
 }

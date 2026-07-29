@@ -992,6 +992,10 @@ def _sandbox_runner_live_policy_ready(health: dict, capabilities: dict) -> bool:
         and health.get("runnerInstanceId") == capabilities.get("runnerInstanceId")
         and capabilities.get("isolation") == "per_task_overlay"
         and capabilities.get("network") == "disabled"
+        and isinstance(capabilities.get("imageFingerprint"), str)
+        and bool(
+            _IMAGE_FINGERPRINT_RE.fullmatch(capabilities["imageFingerprint"])
+        )
         and capabilities.get("artifactExport")
         == {
             "outbox": "/workspace/artifacts",

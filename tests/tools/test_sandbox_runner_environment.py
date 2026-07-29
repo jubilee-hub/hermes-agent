@@ -702,6 +702,7 @@ def test_live_identity_returns_only_the_validated_runner_fingerprint(
     assert sandbox_runner_identity_from_environment() is None
     server.health_runner_instance_id = server.capabilities["runnerInstanceId"]
     server.capabilities["imageFingerprint"] = "/host/image.sif"
+    assert sandbox_runner_ready_from_environment() is False
     assert sandbox_runner_identity_from_environment() is None
 
 
