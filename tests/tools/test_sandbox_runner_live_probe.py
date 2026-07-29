@@ -85,7 +85,25 @@ def _configure_gateway_probe(monkeypatch, server, key="test-secret"):
             )
         }
     )
+    monkeypatch.setattr(live_probe, "load_hermes_dotenv", lambda: [])
     monkeypatch.setattr(live_probe, "load_gateway_config", lambda: config)
+
+
+def test_gateway_probe_loads_standard_hermes_env_before_config(monkeypatch, tmp_path):
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir(mode=0o700)
+    (hermes_home / ".env").write_text(
+        "API_SERVER_KEY=dotenv-only-secret\nAPI_SERVER_PORT=9876\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("API_SERVER_KEY", raising=False)
+    monkeypatch.delenv("API_SERVER_PORT", raising=False)
+
+    base_url, api_key = live_probe._effective_gateway_probe_config()
+
+    assert base_url == "http://127.0.0.1:9876"
+    assert api_key == "dotenv-only-secret"
 
 
 @pytest.mark.parametrize("mode", ["malformed", "oversize"])

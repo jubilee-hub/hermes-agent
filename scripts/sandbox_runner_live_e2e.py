@@ -23,6 +23,7 @@ import urllib.request
 
 from gateway.config import Platform, load_gateway_config
 from gateway.platforms.api_server import APIServerAdapter
+from hermes_cli.env_loader import load_hermes_dotenv
 from tools.environments.sandbox_runner import (
     DEFAULT_SOCKET_PATH,
     DEFAULT_TOKEN_FD,
@@ -49,6 +50,10 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 def _effective_gateway_probe_config() -> tuple[str, str]:
     """Resolve the same config object used by the running API Server adapter."""
     try:
+        # The Gateway entrypoint loads ~/.hermes/.env before building platform
+        # configuration. This standalone subprocess must do the same or a
+        # standard API_SERVER_KEY becomes invisible to the live probe.
+        load_hermes_dotenv()
         gateway_config = load_gateway_config()
         platform_config = gateway_config.platforms.get(Platform.API_SERVER)
         if platform_config is None:
