@@ -580,6 +580,49 @@ async def test_controlled_sandbox_rejects_session_fork_before_mutation(tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_optional_sandbox_rejects_fork_of_bound_session_before_mutation(tmp_path):
+    adapter = _adapter(tmp_path, required=False)
+    db = adapter._session_db
+    db.create_session("sandbox-source", "api_server")
+    db.append_message("sandbox-source", "user", "A-only history")
+    assert db.bind_sandbox_context(
+        "sandbox-source",
+        adapter._sandbox_context_hash(SANDBOX_A),
+    )
+    app = _app(adapter)
+
+    async with TestClient(TestServer(app)) as client:
+        response = await client.post(
+            "/api/sessions/sandbox-source/fork",
+            headers=AUTH,
+            json={"id": "sandbox-fork"},
+        )
+        body = await response.json()
+
+    assert response.status == 503
+    assert body["error"]["code"] == "sandbox_endpoint_unsupported"
+    assert db.get_session("sandbox-source")["ended_at"] is None
+    assert db.get_session("sandbox-fork") is None
+
+
+def test_atomic_fork_loses_to_an_existing_sandbox_binding(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("sandbox-source", "api_server")
+    db.append_message("sandbox-source", "user", "A-only history")
+    assert db.bind_sandbox_context(
+        "sandbox-source",
+        "sha256:" + ("a" * 64),
+    )
+
+    assert (
+        db.fork_session_if_unbound("sandbox-source", "sandbox-fork")
+        == "source_sandbox_bound"
+    )
+    assert db.get_session("sandbox-source")["ended_at"] is None
+    assert db.get_session("sandbox-fork") is None
+
+
+@pytest.mark.asyncio
 async def test_responses_previous_response_rejects_a_different_sandbox(tmp_path):
     adapter = _adapter(tmp_path)
     calls = []

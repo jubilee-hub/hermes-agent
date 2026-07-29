@@ -3388,6 +3388,14 @@ class APIServerAdapter(BasePlatformAdapter):
         source, err = await self._get_existing_session_or_404(source_id)
         if err:
             return err
+        if source.get("sandbox_context_hash") is not None:
+            return web.json_response(
+                _openai_error(
+                    "This endpoint cannot safely fork a sandbox-scoped session.",
+                    code="sandbox_endpoint_unsupported",
+                ),
+                status=503,
+            )
         body, err = await self._read_json_body(request)
         if err:
             return err
@@ -3395,23 +3403,31 @@ class APIServerAdapter(BasePlatformAdapter):
         fork_id = str(body.get("id") or body.get("session_id") or f"api_{int(time.time())}_{uuid.uuid4().hex[:8]}").strip()
         if not fork_id or re.search(r'[\r\n\x00]', fork_id):
             return web.json_response(_openai_error("Invalid session ID", code="invalid_session_id"), status=400)
-        if await asyncio.to_thread(db.get_session, fork_id):
-            return web.json_response(_openai_error(f"Session already exists: {fork_id}", code="session_exists"), status=409)
-
-        # Match the CLI /branch semantics: mark the original as branched, then
-        # create a child session that carries the transcript forward. This uses
-        # SessionDB's native parent_session_id/end_reason visibility model rather
-        # than inventing a parallel fork store.
-        await asyncio.to_thread(db.end_session, source_id, "branched")
-        await asyncio.to_thread(db.create_session,
+        fork_status = await asyncio.to_thread(
+            db.fork_session_if_unbound,
+            source_id,
             fork_id,
-            "api_server",
-            model=source.get("model"),
-            system_prompt=source.get("system_prompt"),
-            parent_session_id=source_id,
         )
-        messages = await asyncio.to_thread(db.get_messages, source_id)
-        await asyncio.to_thread(db.replace_messages, fork_id, messages)
+        if fork_status == "fork_exists":
+            return web.json_response(_openai_error(f"Session already exists: {fork_id}", code="session_exists"), status=409)
+        if fork_status == "source_sandbox_bound":
+            return web.json_response(
+                _openai_error(
+                    "This endpoint cannot safely fork a sandbox-scoped session.",
+                    code="sandbox_endpoint_unsupported",
+                ),
+                status=503,
+            )
+        if fork_status in {"source_missing", "source_ended"}:
+            return web.json_response(
+                _openai_error("Session is unavailable for fork", code="session_unavailable"),
+                status=409,
+            )
+        if fork_status != "created":
+            return web.json_response(
+                _openai_error("Session fork is unavailable", code="session_fork_unavailable"),
+                status=503,
+            )
         title = body.get("title")
         if title is None:
             base = source.get("title") or "fork"
