@@ -21,6 +21,8 @@ import re
 import secrets
 import urllib.request
 
+from gateway.config import Platform, load_gateway_config
+from gateway.platforms.api_server import APIServerAdapter
 from tools.environments.sandbox_runner import (
     DEFAULT_SOCKET_PATH,
     DEFAULT_TOKEN_FD,
@@ -44,15 +46,23 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def _gateway_loopback_url() -> str:
-    """Build the only permitted Gateway origin: cleartext loopback + local port."""
-    raw_port = os.environ.get("API_SERVER_PORT", "8642").strip()
-    if not raw_port.isascii() or not raw_port.isdigit():
+def _effective_gateway_probe_config() -> tuple[str, str]:
+    """Resolve the same config object used by the running API Server adapter."""
+    try:
+        gateway_config = load_gateway_config()
+        platform_config = gateway_config.platforms.get(Platform.API_SERVER)
+        if platform_config is None:
+            raise RuntimeError("Gateway identity probe failed closed.")
+        adapter = APIServerAdapter(platform_config)
+    except Exception as exc:
+        raise RuntimeError("Gateway identity probe failed closed.") from exc
+    api_key = adapter._api_key
+    port = adapter._port
+    if not isinstance(api_key, str) or not api_key:
         raise RuntimeError("Gateway identity probe failed closed.")
-    port = int(raw_port)
     if not 1 <= port <= 65535:
         raise RuntimeError("Gateway identity probe failed closed.")
-    return f"http://127.0.0.1:{port}"
+    return f"http://127.0.0.1:{port}", api_key
 
 
 def _unique_task_key() -> str:
@@ -80,10 +90,7 @@ def _environment(task_key: str) -> SandboxRunnerEnvironment:
 
 def _gateway_identity(task_key: str) -> dict[str, str]:
     """Read the production Gateway identity endpoint without exposing secrets."""
-    api_key = os.environ.get("API_SERVER_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("Gateway identity probe failed closed.")
-    base_url = _gateway_loopback_url()
+    base_url, api_key = _effective_gateway_probe_config()
     request = urllib.request.Request(
         f"{base_url}/v1/dedicated-sandbox-identity",
         data=b"{}",
@@ -95,7 +102,13 @@ def _gateway_identity(task_key: str) -> dict[str, str]:
         },
     )
     try:
-        opener = urllib.request.build_opener(_NoRedirectHandler())
+        # Explicitly suppress environment proxy discovery. Even a loopback URL
+        # can be sent to HTTP_PROXY when NO_PROXY is incomplete, which would
+        # disclose the Gateway bearer credential.
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}),
+            _NoRedirectHandler(),
+        )
         with opener.open(request, timeout=15) as response:
             if response.status != 200:
                 raise RuntimeError("Gateway identity probe failed closed.")

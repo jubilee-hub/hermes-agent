@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from gateway.config import GatewayConfig, Platform, PlatformConfig
 from scripts import sandbox_runner_live_e2e as live_probe
 
 
@@ -43,7 +44,12 @@ def _start_gateway_server(mode: str):
                 )
                 self.end_headers()
                 return
-            body = b"{" if mode == "malformed" else b"x" * 8193
+            if mode == "valid":
+                body = _gateway_payload()
+            elif mode == "malformed":
+                body = b"{"
+            else:
+                body = b"x" * 8193
             self.send_response(200)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -70,14 +76,25 @@ class _FakeLifecycle:
         self.closed = True
 
 
+def _configure_gateway_probe(monkeypatch, server, key="test-secret"):
+    config = GatewayConfig(
+        platforms={
+            Platform.API_SERVER: PlatformConfig(
+                enabled=True,
+                extra={"key": key, "port": server.server_port},
+            )
+        }
+    )
+    monkeypatch.setattr(live_probe, "load_gateway_config", lambda: config)
+
+
 @pytest.mark.parametrize("mode", ["malformed", "oversize"])
 def test_gateway_identity_rejects_malformed_or_oversize_loopback_response(
     monkeypatch,
     mode,
 ):
     server, thread, state = _start_gateway_server(mode)
-    monkeypatch.setenv("API_SERVER_KEY", "test-secret")
-    monkeypatch.setenv("API_SERVER_PORT", str(server.server_port))
+    _configure_gateway_probe(monkeypatch, server)
     try:
         with pytest.raises(RuntimeError, match="failed closed"):
             live_probe._gateway_identity("sandbox-v1-test")
@@ -90,8 +107,7 @@ def test_gateway_identity_rejects_malformed_or_oversize_loopback_response(
 
 def test_gateway_identity_never_follows_redirect_with_bearer_key(monkeypatch):
     server, thread, state = _start_gateway_server("redirect")
-    monkeypatch.setenv("API_SERVER_KEY", "test-secret")
-    monkeypatch.setenv("API_SERVER_PORT", str(server.server_port))
+    _configure_gateway_probe(monkeypatch, server)
     try:
         with pytest.raises(RuntimeError, match="failed closed"):
             live_probe._gateway_identity("sandbox-v1-test")
@@ -100,6 +116,24 @@ def test_gateway_identity_never_follows_redirect_with_bearer_key(monkeypatch):
         server.server_close()
         thread.join(timeout=5)
     assert state["redirect_target_seen"] is False
+
+
+def test_gateway_identity_uses_effective_config_and_bypasses_http_proxy(monkeypatch):
+    server, thread, state = _start_gateway_server("valid")
+    _configure_gateway_probe(monkeypatch, server, key="config-only-secret")
+    monkeypatch.delenv("API_SERVER_KEY", raising=False)
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:1")
+    monkeypatch.setenv("http_proxy", "http://127.0.0.1:1")
+    monkeypatch.setenv("NO_PROXY", "")
+    monkeypatch.setenv("no_proxy", "")
+    try:
+        payload = live_probe._gateway_identity("sandbox-v1-test")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+    assert payload["source"] == "hermes.sandbox_runner_identity"
+    assert state["authorization"] == "Bearer config-only-secret"
 
 
 def test_live_probe_requires_exact_checks_and_cleanup(monkeypatch):
