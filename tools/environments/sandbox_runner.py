@@ -132,11 +132,15 @@ class SandboxRunnerEnvironment(BaseEnvironment):
         timeout: int = 180,
         initialize_session: bool = True,
         token_owner_must_differ: bool = True,
+        ephemeral: bool = False,
     ):
         super().__init__(cwd="/workspace" if not cwd else cwd, timeout=timeout)
         self._task_key = self._validate_task_key(task_key)
         self._socket_path = self._validate_socket_path(socket_path)
         self._token_owner_must_differ = token_owner_must_differ
+        if not isinstance(ephemeral, bool):
+            raise RuntimeError("Sandbox runner lifecycle is unavailable.")
+        self._ephemeral = ephemeral
         self._token_fd = self._validate_token_fd(
             token_fd,
             owner_must_differ=token_owner_must_differ,
@@ -301,6 +305,8 @@ class SandboxRunnerEnvironment(BaseEnvironment):
                 "command": shell_command,
                 "timeoutMs": int(timeout * 1000),
             }
+            if self._ephemeral:
+                payload["ephemeral"] = True
             if stdin_data is not None:
                 payload["stdin"] = stdin_data
 
@@ -729,7 +735,10 @@ def run_sandbox_runner_isolation_canary(task_key: str) -> dict[str, bool]:
             and persistence_result.get("returncode") == 0
         )
 
-        mismatch = _canary_environment(mismatch_key)
+        # The mismatch proof must not consume a ninth persistent user overlay
+        # when the Runner is at its advertised capacity. The Runner gives this
+        # request a separate one-at-a-time, auto-cleaned overlay lifecycle.
+        mismatch = _canary_environment(mismatch_key, ephemeral=True)
         environments.append(mismatch)
         mismatch_result = mismatch.execute(
             f"test ! -e /workspace/{marker}",
@@ -744,10 +753,12 @@ def run_sandbox_runner_isolation_canary(task_key: str) -> dict[str, bool]:
         if mismatch is not None:
             try:
                 removed = mismatch.delete_remote_overlay()
-                # `removed=False` proves there was no durable overlay to clean.
-                # After a completed execution, however, the Runner must have
-                # created one and must report that it removed it.
-                checks["mismatchOverlayRemoved"] = removed or not mismatch_executed
+                # An executed ephemeral mismatch must already be absent. For an
+                # ambiguous failure the overall canary remains failed, but this
+                # cleanup still removes any legacy persistent residue.
+                checks["mismatchOverlayRemoved"] = (
+                    not removed if mismatch_executed else True
+                )
             except Exception:
                 checks["mismatchOverlayRemoved"] = False
         if primary_key is not None and marker is not None:
@@ -772,7 +783,9 @@ def run_sandbox_runner_isolation_canary(task_key: str) -> dict[str, bool]:
     return checks
 
 
-def _canary_environment(task_key: str) -> SandboxRunnerEnvironment:
+def _canary_environment(
+    task_key: str, *, ephemeral: bool = False
+) -> SandboxRunnerEnvironment:
     raw_token_fd = os.getenv(
         "HERMES_SANDBOX_RUNNER_TOKEN_FD",
         str(DEFAULT_TOKEN_FD),
@@ -791,6 +804,7 @@ def _canary_environment(task_key: str) -> SandboxRunnerEnvironment:
         token_fd=token_fd,
         cwd="/workspace",
         initialize_session=False,
+        ephemeral=ephemeral,
     )
 
 

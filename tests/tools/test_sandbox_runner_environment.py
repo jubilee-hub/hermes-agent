@@ -164,7 +164,9 @@ def runner_fixture(tmp_path: Path):
         os.close(token_fd)
 
 
-def _environment(socket_path: Path, token_fd: int) -> SandboxRunnerEnvironment:
+def _environment(
+    socket_path: Path, token_fd: int, *, ephemeral: bool = False
+) -> SandboxRunnerEnvironment:
     return SandboxRunnerEnvironment(
         task_key=TASK_KEY,
         socket_path=str(socket_path),
@@ -172,6 +174,7 @@ def _environment(socket_path: Path, token_fd: int) -> SandboxRunnerEnvironment:
         token_owner_must_differ=False,
         initialize_session=False,
         timeout=3,
+        ephemeral=ephemeral,
     )
 
 
@@ -234,10 +237,31 @@ def test_exec_uses_authenticated_uds_and_maps_bounded_result(runner_fixture):
     assert "builtin cd -- /workspace/project" in str(body["command"])
 
 
+def test_ephemeral_environment_marks_only_the_runner_exec_request(runner_fixture):
+    server, socket_path, token_fd = runner_fixture
+    environment = _environment(socket_path, token_fd, ephemeral=True)
+
+    assert environment.execute("true")["returncode"] == 0
+
+    assert server.requests[0]["body"]["ephemeral"] is True
+    assert server.requests[0]["body"]["taskKey"] == TASK_KEY
+
+    with pytest.raises(RuntimeError, match="lifecycle is unavailable"):
+        SandboxRunnerEnvironment(
+            task_key=TASK_KEY,
+            socket_path=str(socket_path),
+            token_fd=token_fd,
+            token_owner_must_differ=False,
+            initialize_session=False,
+            ephemeral="true",  # type: ignore[arg-type]
+        )
+
+
 def test_isolation_canary_uses_isolated_probe_unique_nonce_and_removes_mismatch(
     monkeypatch,
 ):
     observed: list[tuple[str, str]] = []
+    ephemeral_by_task: dict[str, bool] = {}
     observed_timeouts: list[int | None] = []
     deleted: list[str] = []
     nonces = iter(("1" * 32, "2" * 32))
@@ -249,6 +273,7 @@ def test_isolation_canary_uses_isolated_probe_unique_nonce_and_removes_mismatch(
 
         def __init__(self, *, task_key, **_kwargs):
             self.task_key = task_key
+            ephemeral_by_task[task_key] = _kwargs.get("ephemeral") is True
 
         def execute(self, command, **_kwargs):
             observed.append((self.task_key, command))
@@ -270,7 +295,7 @@ def test_isolation_canary_uses_isolated_probe_unique_nonce_and_removes_mismatch(
 
         def delete_remote_overlay(self):
             deleted.append(self.task_key)
-            return True
+            return not ephemeral_by_task[self.task_key]
 
         def cleanup(self):
             return None
@@ -292,6 +317,9 @@ def test_isolation_canary_uses_isolated_probe_unique_nonce_and_removes_mismatch(
     assert observed[3][0] == TASK_KEY
     assert observed[2][0] != observed[6][0]
     assert deleted == [observed[2][0], observed[6][0]]
+    assert ephemeral_by_task[observed[2][0]] is True
+    assert ephemeral_by_task[observed[6][0]] is True
+    assert ephemeral_by_task[TASK_KEY] is False
     assert "cd / && /usr/local/bin/python3 -I -S -P -" in observed[0][1]
     assert 'open("/proc/net/dev"' in observed[0][1]
     assert 'open("/proc/net/route"' in observed[0][1]
