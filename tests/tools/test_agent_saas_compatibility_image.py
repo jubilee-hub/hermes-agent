@@ -16,13 +16,37 @@ _OFFICIAL_BASE_DIGEST = (
     "sha256:f7b35053268f532f98955195c909f15a230470fbcbdacaa9fdecb95707dad04a"
 )
 _OPTIMIZED_PROBE = """
+import hashlib
+import json
 import os
+import tempfile
+from pathlib import Path
+
 import gateway.platforms.api_server
+from hermes_state import SessionDB
 import tools.environments.sandbox_runner
 from scripts import sandbox_runner_live_e2e as probe
 
 if os.geteuid() != 10000:
     raise RuntimeError("compatibility image probe did not run as hermes")
+
+raw_task_key = "sandbox-v1-" + ("A" * 43)
+context_a = "sha256:" + hashlib.sha256(raw_task_key.encode()).hexdigest()
+context_b = "sha256:" + ("b" * 64)
+state_path = Path(tempfile.mkdtemp()) / "state.db"
+db = SessionDB(state_path)
+if not db.bind_sandbox_context("image-contract-session", context_a):
+    raise RuntimeError("compatibility image did not bind sandbox context")
+if not db.bind_sandbox_context("image-contract-session", context_a):
+    raise RuntimeError("compatibility image sandbox context was not idempotent")
+if db.bind_sandbox_context("image-contract-session", context_b):
+    raise RuntimeError("compatibility image accepted sandbox context rebinding")
+stored = db.get_session("image-contract-session")
+if stored["sandbox_context_hash"] != context_a:
+    raise RuntimeError("compatibility image replaced the bound sandbox context")
+if raw_task_key in json.dumps(stored) or raw_task_key.encode() in state_path.read_bytes():
+    raise RuntimeError("compatibility image persisted the raw sandbox task key")
+db.close()
 
 class Lifecycle:
     def delete_remote_overlay(self):
