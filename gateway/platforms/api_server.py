@@ -1124,6 +1124,8 @@ def _make_request_fingerprint(
 def _derive_chat_session_id(
     system_prompt: Optional[str],
     first_user_message: str,
+    *,
+    sandbox_context_hash: Optional[str] = None,
 ) -> str:
     """Derive a stable session ID from the conversation's first user message.
 
@@ -1135,6 +1137,8 @@ def _derive_chat_session_id(
     directory) across turns.
     """
     seed = f"{system_prompt or ''}\n{first_user_message}"
+    if sandbox_context_hash:
+        seed = f"{sandbox_context_hash}\n{seed}"
     digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
     return f"api-{digest}"
 
@@ -2863,7 +2867,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_resources": True,
                 "session_chat": not self._sandbox_task_key_required,
                 "session_chat_streaming": not self._sandbox_task_key_required,
-                "session_fork": True,
+                "session_fork": not self._sandbox_task_key_required,
                 "admin_config_rw": False,
                 "jobs_admin": False,
                 "memory_write_api": False,
@@ -3372,6 +3376,14 @@ class APIServerAdapter(BasePlatformAdapter):
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
+        if self._sandbox_task_key_required:
+            return web.json_response(
+                _openai_error(
+                    "This endpoint cannot safely fork a sandbox-scoped session.",
+                    code="sandbox_endpoint_unsupported",
+                ),
+                status=503,
+            )
         source_id = request.match_info["session_id"]
         source, err = await self._get_existing_session_or_404(source_id)
         if err:
@@ -3724,7 +3736,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 if cm.get("role") == "user":
                     first_user = cm.get("content", "")
                     break
-            session_id = _derive_chat_session_id(system_prompt, first_user)
+            session_id = _derive_chat_session_id(
+                system_prompt,
+                first_user,
+                sandbox_context_hash=sandbox_context_hash,
+            )
             # history already set from request body above
 
         sandbox_bind_err = await self._bind_sandbox_session_context(

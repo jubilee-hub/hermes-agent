@@ -48,6 +48,10 @@ def _app(adapter):
     app = web.Application()
     app.router.add_get("/health", adapter._handle_health)
     app.router.add_get("/health/detailed", adapter._handle_health_detailed)
+    app.router.add_post(
+        "/api/sessions/{session_id}/fork",
+        adapter._handle_fork_session,
+    )
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_post(
@@ -511,6 +515,71 @@ async def test_chat_session_continuation_rejects_a_different_sandbox(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_derived_chat_session_id_is_scoped_to_the_sandbox(tmp_path):
+    adapter = _adapter(tmp_path)
+    calls = []
+
+    async def fake_run_agent(**kwargs):
+        calls.append(kwargs["sandbox_task_key"])
+        return _result()
+
+    adapter._run_agent = fake_run_agent
+    app = _app(adapter)
+
+    async with TestClient(TestServer(app)) as client:
+        first_a = await client.post(
+            "/v1/chat/completions",
+            headers={**AUTH, "X-Hermes-Sandbox-Task-Key": SANDBOX_A},
+            json=_chat_body(),
+        )
+        first_b = await client.post(
+            "/v1/chat/completions",
+            headers={**AUTH, "X-Hermes-Sandbox-Task-Key": SANDBOX_B},
+            json=_chat_body(),
+        )
+        second_a = await client.post(
+            "/v1/chat/completions",
+            headers={**AUTH, "X-Hermes-Sandbox-Task-Key": SANDBOX_A},
+            json=_chat_body(),
+        )
+
+    assert [first_a.status, first_b.status, second_a.status] == [200, 200, 200]
+    session_a = first_a.headers["X-Hermes-Session-Id"]
+    session_b = first_b.headers["X-Hermes-Session-Id"]
+    assert session_a != session_b
+    assert second_a.headers["X-Hermes-Session-Id"] == session_a
+    assert SANDBOX_A not in session_a
+    assert SANDBOX_B not in session_b
+    assert calls == [SANDBOX_A, SANDBOX_B, SANDBOX_A]
+
+
+@pytest.mark.asyncio
+async def test_controlled_sandbox_rejects_session_fork_before_mutation(tmp_path):
+    adapter = _adapter(tmp_path)
+    db = adapter._session_db
+    db.create_session("sandbox-source", "api_server")
+    db.append_message("sandbox-source", "user", "A-only history")
+    assert db.bind_sandbox_context(
+        "sandbox-source",
+        adapter._sandbox_context_hash(SANDBOX_A),
+    )
+    app = _app(adapter)
+
+    async with TestClient(TestServer(app)) as client:
+        response = await client.post(
+            "/api/sessions/sandbox-source/fork",
+            headers={**AUTH, "X-Hermes-Sandbox-Task-Key": SANDBOX_A},
+            json={"id": "sandbox-fork"},
+        )
+        body = await response.json()
+
+    assert response.status == 503
+    assert body["error"]["code"] == "sandbox_endpoint_unsupported"
+    assert db.get_session("sandbox-source")["ended_at"] is None
+    assert db.get_session("sandbox-fork") is None
+
+
+@pytest.mark.asyncio
 async def test_responses_previous_response_rejects_a_different_sandbox(tmp_path):
     adapter = _adapter(tmp_path)
     calls = []
@@ -842,6 +911,7 @@ async def test_capabilities_advertise_controlled_sandbox_contract(tmp_path):
         "X-Hermes-Sandbox-Task-Key"
     )
     assert body["features"]["sandbox_task_key_required"] is True
+    assert body["features"]["session_fork"] is False
     supported_endpoints = set(body["features"]["sandbox_task_supported_endpoints"])
     # This is a security allowlist, not a catalog snapshot: adding any agent
     # endpoint requires an explicit identity-bridge review and test update.
