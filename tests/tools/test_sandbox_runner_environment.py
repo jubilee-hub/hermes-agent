@@ -165,7 +165,10 @@ def runner_fixture(tmp_path: Path):
 
 
 def _environment(
-    socket_path: Path, token_fd: int, *, ephemeral: bool = False
+    socket_path: Path,
+    token_fd: int,
+    *,
+    canary_capacity_reservation: bool = False,
 ) -> SandboxRunnerEnvironment:
     return SandboxRunnerEnvironment(
         task_key=TASK_KEY,
@@ -174,7 +177,7 @@ def _environment(
         token_owner_must_differ=False,
         initialize_session=False,
         timeout=3,
-        ephemeral=ephemeral,
+        canary_capacity_reservation=canary_capacity_reservation,
     )
 
 
@@ -231,20 +234,26 @@ def test_exec_uses_authenticated_uds_and_maps_bounded_result(runner_fixture):
     assert isinstance(body, dict)
     assert body["schemaVersion"] == 1
     assert body["taskKey"] == TASK_KEY
+    assert "canaryCapacityReservation" not in body
     assert body["stdin"] == "input"
     assert body["timeoutMs"] == 2000
     assert "printf user-command" in str(body["command"])
     assert "builtin cd -- /workspace/project" in str(body["command"])
 
 
-def test_ephemeral_environment_marks_only_the_runner_exec_request(runner_fixture):
+def test_canary_capacity_reservation_marks_exec_and_cleanup_requests(runner_fixture):
     server, socket_path, token_fd = runner_fixture
-    environment = _environment(socket_path, token_fd, ephemeral=True)
+    environment = _environment(
+        socket_path, token_fd, canary_capacity_reservation=True
+    )
 
     assert environment.execute("true")["returncode"] == 0
+    assert environment.delete_remote_overlay() is True
 
-    assert server.requests[0]["body"]["ephemeral"] is True
+    assert server.requests[0]["body"]["canaryCapacityReservation"] is True
     assert server.requests[0]["body"]["taskKey"] == TASK_KEY
+    assert server.requests[1]["body"]["canaryCapacityReservation"] is True
+    assert server.requests[1]["body"]["taskKey"] == TASK_KEY
 
     with pytest.raises(RuntimeError, match="lifecycle is unavailable"):
         SandboxRunnerEnvironment(
@@ -253,7 +262,7 @@ def test_ephemeral_environment_marks_only_the_runner_exec_request(runner_fixture
             token_fd=token_fd,
             token_owner_must_differ=False,
             initialize_session=False,
-            ephemeral="true",  # type: ignore[arg-type]
+            canary_capacity_reservation="true",  # type: ignore[arg-type]
         )
 
 
@@ -261,7 +270,7 @@ def test_isolation_canary_uses_isolated_probe_unique_nonce_and_removes_mismatch(
     monkeypatch,
 ):
     observed: list[tuple[str, str]] = []
-    ephemeral_by_task: dict[str, bool] = {}
+    reservation_by_task: dict[str, bool] = {}
     observed_timeouts: list[int | None] = []
     deleted: list[str] = []
     nonces = iter(("1" * 32, "2" * 32))
@@ -273,7 +282,9 @@ def test_isolation_canary_uses_isolated_probe_unique_nonce_and_removes_mismatch(
 
         def __init__(self, *, task_key, **_kwargs):
             self.task_key = task_key
-            ephemeral_by_task[task_key] = _kwargs.get("ephemeral") is True
+            reservation_by_task[task_key] = (
+                _kwargs.get("canary_capacity_reservation") is True
+            )
 
         def execute(self, command, **_kwargs):
             observed.append((self.task_key, command))
@@ -295,7 +306,7 @@ def test_isolation_canary_uses_isolated_probe_unique_nonce_and_removes_mismatch(
 
         def delete_remote_overlay(self):
             deleted.append(self.task_key)
-            return not ephemeral_by_task[self.task_key]
+            return True
 
         def cleanup(self):
             return None
@@ -317,9 +328,9 @@ def test_isolation_canary_uses_isolated_probe_unique_nonce_and_removes_mismatch(
     assert observed[3][0] == TASK_KEY
     assert observed[2][0] != observed[6][0]
     assert deleted == [observed[2][0], observed[6][0]]
-    assert ephemeral_by_task[observed[2][0]] is True
-    assert ephemeral_by_task[observed[6][0]] is True
-    assert ephemeral_by_task[TASK_KEY] is False
+    assert reservation_by_task[observed[2][0]] is True
+    assert reservation_by_task[observed[6][0]] is True
+    assert reservation_by_task[TASK_KEY] is False
     assert "cd / && /usr/local/bin/python3 -I -S -P -" in observed[0][1]
     assert 'open("/proc/net/dev"' in observed[0][1]
     assert 'open("/proc/net/route"' in observed[0][1]

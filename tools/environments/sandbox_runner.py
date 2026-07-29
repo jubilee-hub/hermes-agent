@@ -132,15 +132,15 @@ class SandboxRunnerEnvironment(BaseEnvironment):
         timeout: int = 180,
         initialize_session: bool = True,
         token_owner_must_differ: bool = True,
-        ephemeral: bool = False,
+        canary_capacity_reservation: bool = False,
     ):
         super().__init__(cwd="/workspace" if not cwd else cwd, timeout=timeout)
         self._task_key = self._validate_task_key(task_key)
         self._socket_path = self._validate_socket_path(socket_path)
         self._token_owner_must_differ = token_owner_must_differ
-        if not isinstance(ephemeral, bool):
+        if not isinstance(canary_capacity_reservation, bool):
             raise RuntimeError("Sandbox runner lifecycle is unavailable.")
-        self._ephemeral = ephemeral
+        self._canary_capacity_reservation = canary_capacity_reservation
         self._token_fd = self._validate_token_fd(
             token_fd,
             owner_must_differ=token_owner_must_differ,
@@ -305,8 +305,8 @@ class SandboxRunnerEnvironment(BaseEnvironment):
                 "command": shell_command,
                 "timeoutMs": int(timeout * 1000),
             }
-            if self._ephemeral:
-                payload["ephemeral"] = True
+            if self._canary_capacity_reservation:
+                payload["canaryCapacityReservation"] = True
             if stdin_data is not None:
                 payload["stdin"] = stdin_data
 
@@ -596,6 +596,8 @@ class SandboxRunnerEnvironment(BaseEnvironment):
                 "schemaVersion": 1,
                 "taskKey": self._task_key,
             }
+            if self._canary_capacity_reservation:
+                payload["canaryCapacityReservation"] = True
             body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
             token = self._read_token()
             connection = _UnixHTTPConnection(
@@ -735,10 +737,13 @@ def run_sandbox_runner_isolation_canary(task_key: str) -> dict[str, bool]:
             and persistence_result.get("returncode") == 0
         )
 
-        # The mismatch proof must not consume a ninth persistent user overlay
-        # when the Runner is at its advertised capacity. The Runner gives this
-        # request a separate one-at-a-time, auto-cleaned overlay lifecycle.
-        mismatch = _canary_environment(mismatch_key, ephemeral=True)
+        # Reserve one additional capacity slot without changing the task-key,
+        # durable overlay, or Apptainer execution path being tested. A task-id
+        # alias with the primary therefore fails closed instead of being hidden
+        # by a guaranteed-fresh temporary storage namespace.
+        mismatch = _canary_environment(
+            mismatch_key, canary_capacity_reservation=True
+        )
         environments.append(mismatch)
         mismatch_result = mismatch.execute(
             f"test ! -e /workspace/{marker}",
@@ -753,12 +758,7 @@ def run_sandbox_runner_isolation_canary(task_key: str) -> dict[str, bool]:
         if mismatch is not None:
             try:
                 removed = mismatch.delete_remote_overlay()
-                # An executed ephemeral mismatch must already be absent. For an
-                # ambiguous failure the overall canary remains failed, but this
-                # cleanup still removes any legacy persistent residue.
-                checks["mismatchOverlayRemoved"] = (
-                    not removed if mismatch_executed else True
-                )
+                checks["mismatchOverlayRemoved"] = removed or not mismatch_executed
             except Exception:
                 checks["mismatchOverlayRemoved"] = False
         if primary_key is not None and marker is not None:
@@ -784,7 +784,7 @@ def run_sandbox_runner_isolation_canary(task_key: str) -> dict[str, bool]:
 
 
 def _canary_environment(
-    task_key: str, *, ephemeral: bool = False
+    task_key: str, *, canary_capacity_reservation: bool = False
 ) -> SandboxRunnerEnvironment:
     raw_token_fd = os.getenv(
         "HERMES_SANDBOX_RUNNER_TOKEN_FD",
@@ -804,7 +804,7 @@ def _canary_environment(
         token_fd=token_fd,
         cwd="/workspace",
         initialize_session=False,
-        ephemeral=ephemeral,
+        canary_capacity_reservation=canary_capacity_reservation,
     )
 
 
