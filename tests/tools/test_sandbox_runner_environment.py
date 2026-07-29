@@ -13,15 +13,21 @@ import time
 import traceback
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
 
 import tools.environments.sandbox_runner as sandbox_runner
+from gateway.config import PlatformConfig
+from gateway.platforms.api_server import APIServerAdapter
 from tools.environments.sandbox_runner import (
     SANDBOX_RUNNER_CANARY_CHECKS,
     SandboxRunnerEnvironment,
     read_sandbox_runner_artifact,
     run_sandbox_runner_isolation_canary,
+    sandbox_runner_identity_from_environment,
     sandbox_runner_ready_from_environment,
 )
 from tools.terminal_tool import scoped_task_env_overrides
@@ -56,6 +62,7 @@ class _ThreadedUnixHTTPServer(
         self.health_delay_seconds = 0.0
         self.capabilities: dict[str, object] = {
             "schemaVersion": 1,
+            "runnerInstanceId": "sandbox-runner-v1-" + ("a" * 32),
             "isolation": "per_task_overlay",
             "network": "disabled",
             "imageFingerprint": "sha256:" + ("a" * 64),
@@ -66,6 +73,7 @@ class _ThreadedUnixHTTPServer(
             },
             "limits": {"maxTimeoutMs": 300_000},
         }
+        self.health_runner_instance_id = self.capabilities["runnerInstanceId"]
         self.cleanup_response: dict[str, object] = {
             "schemaVersion": 1,
             "ok": True,
@@ -109,6 +117,7 @@ class _RunnerHandler(BaseHTTPRequestHandler):
             time.sleep(self.server.health_delay_seconds)
             payload = {
                 "schemaVersion": 1,
+                "runnerInstanceId": self.server.health_runner_instance_id,
                 "status": "ready",
                 "checks": {"apptainer": "passed", "auth": "passed"},
             }
@@ -155,7 +164,12 @@ def runner_fixture(tmp_path: Path):
         os.close(token_fd)
 
 
-def _environment(socket_path: Path, token_fd: int) -> SandboxRunnerEnvironment:
+def _environment(
+    socket_path: Path,
+    token_fd: int,
+    *,
+    canary_capacity_reservation: bool = False,
+) -> SandboxRunnerEnvironment:
     return SandboxRunnerEnvironment(
         task_key=TASK_KEY,
         socket_path=str(socket_path),
@@ -163,6 +177,7 @@ def _environment(socket_path: Path, token_fd: int) -> SandboxRunnerEnvironment:
         token_owner_must_differ=False,
         initialize_session=False,
         timeout=3,
+        canary_capacity_reservation=canary_capacity_reservation,
     )
 
 
@@ -219,16 +234,43 @@ def test_exec_uses_authenticated_uds_and_maps_bounded_result(runner_fixture):
     assert isinstance(body, dict)
     assert body["schemaVersion"] == 1
     assert body["taskKey"] == TASK_KEY
+    assert "canaryCapacityReservation" not in body
     assert body["stdin"] == "input"
     assert body["timeoutMs"] == 2000
     assert "printf user-command" in str(body["command"])
     assert "builtin cd -- /workspace/project" in str(body["command"])
 
 
+def test_canary_capacity_reservation_marks_exec_and_cleanup_requests(runner_fixture):
+    server, socket_path, token_fd = runner_fixture
+    environment = _environment(
+        socket_path, token_fd, canary_capacity_reservation=True
+    )
+
+    assert environment.execute("true")["returncode"] == 0
+    assert environment.delete_remote_overlay() is True
+
+    assert server.requests[0]["body"]["canaryCapacityReservation"] is True
+    assert server.requests[0]["body"]["taskKey"] == TASK_KEY
+    assert server.requests[1]["body"]["canaryCapacityReservation"] is True
+    assert server.requests[1]["body"]["taskKey"] == TASK_KEY
+
+    with pytest.raises(RuntimeError, match="lifecycle is unavailable"):
+        SandboxRunnerEnvironment(
+            task_key=TASK_KEY,
+            socket_path=str(socket_path),
+            token_fd=token_fd,
+            token_owner_must_differ=False,
+            initialize_session=False,
+            canary_capacity_reservation="true",  # type: ignore[arg-type]
+        )
+
+
 def test_isolation_canary_uses_isolated_probe_unique_nonce_and_removes_mismatch(
     monkeypatch,
 ):
     observed: list[tuple[str, str]] = []
+    reservation_by_task: dict[str, bool] = {}
     observed_timeouts: list[int | None] = []
     deleted: list[str] = []
     nonces = iter(("1" * 32, "2" * 32))
@@ -240,6 +282,9 @@ def test_isolation_canary_uses_isolated_probe_unique_nonce_and_removes_mismatch(
 
         def __init__(self, *, task_key, **_kwargs):
             self.task_key = task_key
+            reservation_by_task[task_key] = (
+                _kwargs.get("canary_capacity_reservation") is True
+            )
 
         def execute(self, command, **_kwargs):
             observed.append((self.task_key, command))
@@ -283,6 +328,9 @@ def test_isolation_canary_uses_isolated_probe_unique_nonce_and_removes_mismatch(
     assert observed[3][0] == TASK_KEY
     assert observed[2][0] != observed[6][0]
     assert deleted == [observed[2][0], observed[6][0]]
+    assert reservation_by_task[observed[2][0]] is True
+    assert reservation_by_task[observed[6][0]] is True
+    assert reservation_by_task[TASK_KEY] is False
     assert "cd / && /usr/local/bin/python3 -I -S -P -" in observed[0][1]
     assert 'open("/proc/net/dev"' in observed[0][1]
     assert 'open("/proc/net/route"' in observed[0][1]
@@ -665,6 +713,85 @@ def test_live_readiness_requires_the_exact_artifact_export_policy(
     assert isinstance(artifact_export, dict)
     artifact_export["pathPolicy"] = "unsafe_follow"
     assert sandbox_runner_ready_from_environment() is False
+
+
+def test_live_identity_returns_only_the_validated_runner_fingerprint(
+    runner_fixture,
+    monkeypatch,
+):
+    server, socket_path, token_fd = runner_fixture
+    monkeypatch.setenv("HERMES_SANDBOX_RUNNER_SOCKET_PATH", str(socket_path))
+    monkeypatch.setenv("HERMES_SANDBOX_RUNNER_TOKEN_FD", str(token_fd))
+    monkeypatch.setattr(
+        sandbox_runner,
+        "_effective_uid",
+        lambda: os.fstat(token_fd).st_uid + 1,
+    )
+
+    expected = server.capabilities["imageFingerprint"]
+    assert sandbox_runner_identity_from_environment() == {
+        "runnerInstanceId": server.capabilities["runnerInstanceId"],
+        "imageFingerprint": expected,
+    }
+
+    server.capabilities["runnerInstanceId"] = "pid-123"
+    assert sandbox_runner_identity_from_environment() is None
+    server.capabilities["runnerInstanceId"] = "sandbox-runner-v1-" + ("a" * 32)
+    server.health_runner_instance_id = "sandbox-runner-v1-" + ("b" * 32)
+    assert sandbox_runner_identity_from_environment() is None
+    server.health_runner_instance_id = server.capabilities["runnerInstanceId"]
+    server.capabilities["imageFingerprint"] = "/host/image.sif"
+    assert sandbox_runner_ready_from_environment() is False
+    assert sandbox_runner_identity_from_environment() is None
+
+
+@pytest.mark.asyncio
+async def test_api_identity_reads_the_authenticated_live_runner_over_uds(
+    runner_fixture,
+    monkeypatch,
+):
+    server, socket_path, token_fd = runner_fixture
+    monkeypatch.setenv("HERMES_SANDBOX_RUNNER_SOCKET_PATH", str(socket_path))
+    monkeypatch.setenv("HERMES_SANDBOX_RUNNER_TOKEN_FD", str(token_fd))
+    monkeypatch.setattr(
+        sandbox_runner,
+        "_effective_uid",
+        lambda: os.fstat(token_fd).st_uid + 1,
+    )
+    adapter = APIServerAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"key": "sk-test", "sandbox_task_key_required": True},
+        )
+    )
+    app = web.Application()
+    app.router.add_post(
+        "/v1/dedicated-sandbox-identity",
+        adapter._handle_dedicated_sandbox_identity,
+    )
+
+    with patch(
+        "gateway.run._load_gateway_config",
+        return_value={"platform_toolsets": {"api_server": ["code_execution"]}},
+    ):
+        async with TestClient(TestServer(app)) as client:
+            response = await client.post(
+                "/v1/dedicated-sandbox-identity",
+                headers={
+                    "Authorization": "Bearer sk-test",
+                    "X-Hermes-Sandbox-Task-Key": TASK_KEY,
+                },
+                json={},
+            )
+            body = await response.json()
+
+    assert response.status == 200, body
+    assert body == {
+        "source": "hermes.sandbox_runner_identity",
+        "runtimeInstanceId": adapter._runtime_instance_id,
+        "runnerInstanceId": server.capabilities["runnerInstanceId"],
+        "runnerImageFingerprint": server.capabilities["imageFingerprint"],
+    }
 
 
 def test_live_readiness_allows_a_bounded_slow_host_probe(

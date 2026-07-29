@@ -26,6 +26,8 @@ from tools.environments.base import BaseEnvironment, _ThreadedProcessHandle
 DEFAULT_SOCKET_PATH = "/run/agent-saas-sandbox-runner/runner.sock"
 DEFAULT_TOKEN_FD = 8
 _TASK_KEY_RE = re.compile(r"^sandbox-v1-[A-Za-z0-9_-]{43}$")
+_IMAGE_FINGERPRINT_RE = re.compile(r"^sha256:[a-f0-9]{64}$")
+_RUNNER_INSTANCE_ID_RE = re.compile(r"^sandbox-runner-v1-[a-f0-9]{32}$")
 _MAX_COMMAND_CHARS = 65_536
 _MAX_STDIN_CHARS = 1_048_576
 _MAX_OUTPUT_BYTES = 1_048_576
@@ -130,11 +132,15 @@ class SandboxRunnerEnvironment(BaseEnvironment):
         timeout: int = 180,
         initialize_session: bool = True,
         token_owner_must_differ: bool = True,
+        canary_capacity_reservation: bool = False,
     ):
         super().__init__(cwd="/workspace" if not cwd else cwd, timeout=timeout)
         self._task_key = self._validate_task_key(task_key)
         self._socket_path = self._validate_socket_path(socket_path)
         self._token_owner_must_differ = token_owner_must_differ
+        if not isinstance(canary_capacity_reservation, bool):
+            raise RuntimeError("Sandbox runner lifecycle is unavailable.")
+        self._canary_capacity_reservation = canary_capacity_reservation
         self._token_fd = self._validate_token_fd(
             token_fd,
             owner_must_differ=token_owner_must_differ,
@@ -299,6 +305,8 @@ class SandboxRunnerEnvironment(BaseEnvironment):
                 "command": shell_command,
                 "timeoutMs": int(timeout * 1000),
             }
+            if self._canary_capacity_reservation:
+                payload["canaryCapacityReservation"] = True
             if stdin_data is not None:
                 payload["stdin"] = stdin_data
 
@@ -588,6 +596,8 @@ class SandboxRunnerEnvironment(BaseEnvironment):
                 "schemaVersion": 1,
                 "taskKey": self._task_key,
             }
+            if self._canary_capacity_reservation:
+                payload["canaryCapacityReservation"] = True
             body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
             token = self._read_token()
             connection = _UnixHTTPConnection(
@@ -727,7 +737,13 @@ def run_sandbox_runner_isolation_canary(task_key: str) -> dict[str, bool]:
             and persistence_result.get("returncode") == 0
         )
 
-        mismatch = _canary_environment(mismatch_key)
+        # Reserve one additional capacity slot without changing the task-key,
+        # durable overlay, or Apptainer execution path being tested. A task-id
+        # alias with the primary therefore fails closed instead of being hidden
+        # by a guaranteed-fresh temporary storage namespace.
+        mismatch = _canary_environment(
+            mismatch_key, canary_capacity_reservation=True
+        )
         environments.append(mismatch)
         mismatch_result = mismatch.execute(
             f"test ! -e /workspace/{marker}",
@@ -742,9 +758,6 @@ def run_sandbox_runner_isolation_canary(task_key: str) -> dict[str, bool]:
         if mismatch is not None:
             try:
                 removed = mismatch.delete_remote_overlay()
-                # `removed=False` proves there was no durable overlay to clean.
-                # After a completed execution, however, the Runner must have
-                # created one and must report that it removed it.
                 checks["mismatchOverlayRemoved"] = removed or not mismatch_executed
             except Exception:
                 checks["mismatchOverlayRemoved"] = False
@@ -770,7 +783,9 @@ def run_sandbox_runner_isolation_canary(task_key: str) -> dict[str, bool]:
     return checks
 
 
-def _canary_environment(task_key: str) -> SandboxRunnerEnvironment:
+def _canary_environment(
+    task_key: str, *, canary_capacity_reservation: bool = False
+) -> SandboxRunnerEnvironment:
     raw_token_fd = os.getenv(
         "HERMES_SANDBOX_RUNNER_TOKEN_FD",
         str(DEFAULT_TOKEN_FD),
@@ -789,6 +804,7 @@ def _canary_environment(task_key: str) -> SandboxRunnerEnvironment:
         token_fd=token_fd,
         cwd="/workspace",
         initialize_session=False,
+        canary_capacity_reservation=canary_capacity_reservation,
     )
 
 
@@ -904,6 +920,40 @@ def sandbox_runner_ready_from_environment() -> bool:
     to ``False`` so transport or credential details never enter an HTTP body or
     log message.
     """
+    state = _sandbox_runner_live_state_from_environment()
+    if state is None:
+        return False
+    return _sandbox_runner_live_policy_ready(*state)
+
+
+def sandbox_runner_identity_from_environment() -> dict[str, str] | None:
+    """Return the live, readiness-verified Runner generation and SIF fingerprint.
+
+    The unauthenticated health probe recomputes the configured SIF digest before
+    reporting ready, while the authenticated capabilities response carries the
+    bounded fingerprint. Returning no paths or transport details keeps this safe
+    for the API-server's control-plane identity endpoint.
+    """
+    state = _sandbox_runner_live_state_from_environment()
+    if state is None or not _sandbox_runner_live_policy_ready(*state):
+        return None
+    fingerprint = state[1].get("imageFingerprint")
+    runner_instance_id = state[1].get("runnerInstanceId")
+    if not isinstance(fingerprint, str) or not _IMAGE_FINGERPRINT_RE.fullmatch(
+        fingerprint
+    ):
+        return None
+    if not isinstance(runner_instance_id, str) or not _RUNNER_INSTANCE_ID_RE.fullmatch(
+        runner_instance_id
+    ):
+        return None
+    return {
+        "runnerInstanceId": runner_instance_id,
+        "imageFingerprint": fingerprint,
+    }
+
+
+def _sandbox_runner_live_state_from_environment() -> tuple[dict, dict] | None:
     try:
         raw_token_fd = os.getenv(
             "HERMES_SANDBOX_RUNNER_TOKEN_FD",
@@ -936,23 +986,38 @@ def sandbox_runner_ready_from_environment() -> bool:
             path="/v1/capabilities",
             token=token,
         )
-        return (
-            health.get("schemaVersion") == 1
-            and health.get("status") == "ready"
-            and isinstance(health.get("checks"), dict)
-            and capabilities.get("schemaVersion") == 1
-            and capabilities.get("isolation") == "per_task_overlay"
-            and capabilities.get("network") == "disabled"
-            and capabilities.get("artifactExport")
-            == {
-                "outbox": "/workspace/artifacts",
-                "pathPolicy": "plain_filename_no_follow",
-                "maxBytes": _MAX_ARTIFACT_BYTES,
-            }
-            and isinstance(capabilities.get("limits"), dict)
-        )
+        return health, capabilities
     except Exception:
-        return False
+        return None
+
+
+def _sandbox_runner_live_policy_ready(health: dict, capabilities: dict) -> bool:
+    return (
+        health.get("schemaVersion") == 1
+        and health.get("status") == "ready"
+        and isinstance(health.get("checks"), dict)
+        and isinstance(health.get("runnerInstanceId"), str)
+        and bool(_RUNNER_INSTANCE_ID_RE.fullmatch(health["runnerInstanceId"]))
+        and capabilities.get("schemaVersion") == 1
+        and isinstance(capabilities.get("runnerInstanceId"), str)
+        and bool(
+            _RUNNER_INSTANCE_ID_RE.fullmatch(capabilities["runnerInstanceId"])
+        )
+        and health.get("runnerInstanceId") == capabilities.get("runnerInstanceId")
+        and capabilities.get("isolation") == "per_task_overlay"
+        and capabilities.get("network") == "disabled"
+        and isinstance(capabilities.get("imageFingerprint"), str)
+        and bool(
+            _IMAGE_FINGERPRINT_RE.fullmatch(capabilities["imageFingerprint"])
+        )
+        and capabilities.get("artifactExport")
+        == {
+            "outbox": "/workspace/artifacts",
+            "pathPolicy": "plain_filename_no_follow",
+            "maxBytes": _MAX_ARTIFACT_BYTES,
+        }
+        and isinstance(capabilities.get("limits"), dict)
+    )
 
 
 def _runner_probe_json(
