@@ -36,7 +36,13 @@ _MAX_ARTIFACT_BYTES = 16 * 1_048_576
 _MAX_ARTIFACT_RESPONSE_BYTES = ((_MAX_ARTIFACT_BYTES + 2) // 3) * 4 + 65_536
 _ARTIFACT_REQUEST_TIMEOUT_SECONDS = 35.0
 _CLEANUP_REQUEST_TIMEOUT_SECONDS = 15.0
-_READINESS_REQUEST_TIMEOUT_SECONDS = 5.0
+# The Runner's first readiness probe hashes the pinned SIF and executes a
+# bounded artifact-runtime check. The production image is currently 1 GiB and
+# takes about four seconds on an idle T1 host, so a five-second transport limit
+# spuriously fails under ordinary overlapping health/canary load. The Runner
+# single-flights and briefly caches successful probes; this remains a bounded
+# fail-closed guard for a genuinely unavailable host.
+_READINESS_REQUEST_TIMEOUT_SECONDS = 12.0
 _CANARY_EXECUTION_TIMEOUT_SECONDS = 30
 _MAX_ARTIFACT_FILENAME_BYTES = 240
 _MIN_TOKEN_BYTES = 32

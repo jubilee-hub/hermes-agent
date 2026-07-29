@@ -25,10 +25,21 @@ from pathlib import Path
 import gateway.platforms.api_server
 from hermes_state import SessionDB
 import tools.environments.sandbox_runner
+from tools.terminal_tool import scoped_task_env_overrides
 from scripts import sandbox_runner_live_e2e as probe
 
 if os.geteuid() != 10000:
     raise RuntimeError("compatibility image probe did not run as hermes")
+
+scoped_task_id = "sandbox-task-" + ("d" * 64)
+with scoped_task_env_overrides(
+    scoped_task_id,
+    {
+        "env_type": "sandbox_runner",
+        "sandbox_task_key": "sandbox-v1-" + ("D" * 43),
+    },
+):
+    pass
 
 raw_task_key = "sandbox-v1-" + ("A" * 43)
 context_a = "sha256:" + hashlib.sha256(raw_task_key.encode()).hexdigest()
