@@ -950,6 +950,7 @@ def _admit_api_agent_request(handler):
                 "_handle_chat_completions",
                 "_handle_responses",
                 "_handle_dedicated_sandbox_canary",
+                "_handle_dedicated_sandbox_cleanup",
                 "_handle_dedicated_sandbox_identity",
             }
         ):
@@ -1770,6 +1771,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/capabilities", self._handle_capabilities),
             ("POST", "/v1/session-root-canary", self._handle_session_root_canary),
             ("POST", "/v1/dedicated-sandbox-canary", self._handle_dedicated_sandbox_canary),
+            ("POST", "/v1/dedicated-sandbox-cleanup", self._handle_dedicated_sandbox_cleanup),
             ("POST", "/v1/dedicated-sandbox-identity", self._handle_dedicated_sandbox_identity),
             ("GET", "/v1/workspace/files", self._handle_workspace_files),
             ("GET", "/v1/workspace/file", self._handle_workspace_file),
@@ -2449,6 +2451,53 @@ class APIServerAdapter(BasePlatformAdapter):
         )
 
     @_admit_api_agent_request
+    async def _handle_dedicated_sandbox_cleanup(
+        self,
+        request: "web.Request",
+    ) -> "web.Response":
+        """Delete exactly one authenticated opaque task overlay via the Runner."""
+        if not self._sandbox_task_key_required:
+            return web.json_response(
+                _openai_error(
+                    "Dedicated sandbox cleanup is unavailable.",
+                    code="sandbox_runner_not_configured",
+                ),
+                status=503,
+            )
+        sandbox_task_key = request.get("hermes_sandbox_task_key")
+        if not sandbox_task_key:
+            return web.json_response(
+                _openai_error(
+                    "X-Hermes-Sandbox-Task-Key is required.",
+                    code="sandbox_task_key_required",
+                ),
+                status=400,
+            )
+        from tools.environments.sandbox_runner import (
+            delete_sandbox_runner_overlay,
+        )
+
+        try:
+            removed = await asyncio.to_thread(
+                delete_sandbox_runner_overlay,
+                sandbox_task_key,
+            )
+        except Exception:
+            return web.json_response(
+                _openai_error(
+                    "Sandbox Runner cleanup failed closed.",
+                    code="sandbox_runner_cleanup_failed",
+                ),
+                status=503,
+            )
+        return web.json_response(
+            {
+                "source": "hermes.sandbox_runner_cleanup",
+                "removed": removed,
+            }
+        )
+
+    @_admit_api_agent_request
     async def _handle_dedicated_sandbox_identity(
         self,
         request: "web.Request",
@@ -2881,6 +2930,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "sandbox_task_supported_endpoints": [
                     "/v1/chat/completions",
                     "/v1/dedicated-sandbox-canary",
+                    "/v1/dedicated-sandbox-cleanup",
                     "/v1/dedicated-sandbox-identity",
                     "/v1/responses",
                 ],
@@ -2902,6 +2952,10 @@ class APIServerAdapter(BasePlatformAdapter):
                         "dedicated_sandbox_canary": {
                             "method": "POST",
                             "path": "/v1/dedicated-sandbox-canary",
+                        },
+                        "dedicated_sandbox_cleanup": {
+                            "method": "POST",
+                            "path": "/v1/dedicated-sandbox-cleanup",
                         },
                         "dedicated_sandbox_identity": {
                             "method": "POST",

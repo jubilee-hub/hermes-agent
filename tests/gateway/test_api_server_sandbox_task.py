@@ -5,7 +5,7 @@ import hashlib
 import json
 import threading
 import uuid
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 import pytest
 from aiohttp import web
@@ -61,6 +61,10 @@ def _app(adapter):
     app.router.add_post(
         "/v1/dedicated-sandbox-identity",
         adapter._handle_dedicated_sandbox_identity,
+    )
+    app.router.add_post(
+        "/v1/dedicated-sandbox-cleanup",
+        adapter._handle_dedicated_sandbox_cleanup,
     )
     app.router.add_post("/v1/runs", adapter._handle_runs)
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
@@ -213,6 +217,81 @@ async def test_dedicated_canary_requires_auth_and_uses_only_header_task_identity
     }
     canary.assert_called_once_with(SANDBOX_A)
     assert identity.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_dedicated_cleanup_requires_auth_and_deletes_only_header_task_identity(
+    tmp_path,
+):
+    adapter = _adapter(tmp_path)
+    app = _app(adapter)
+
+    with patch(
+        "tools.environments.sandbox_runner.delete_sandbox_runner_overlay",
+        side_effect=[True, False],
+    ) as cleanup:
+        async with TestClient(TestServer(app)) as client:
+            unauthenticated = await client.post(
+                "/v1/dedicated-sandbox-cleanup",
+                headers={"X-Hermes-Sandbox-Task-Key": SANDBOX_A},
+                json={},
+            )
+            missing = await client.post(
+                "/v1/dedicated-sandbox-cleanup",
+                headers=AUTH,
+                json={},
+            )
+            response = await client.post(
+                "/v1/dedicated-sandbox-cleanup",
+                headers={**AUTH, "X-Hermes-Sandbox-Task-Key": SANDBOX_A},
+                json={"taskKey": SANDBOX_B, "hostPath": "/must/not/be/used"},
+            )
+            payload = await response.json()
+            retry = await client.post(
+                "/v1/dedicated-sandbox-cleanup",
+                headers={**AUTH, "X-Hermes-Sandbox-Task-Key": SANDBOX_A},
+                json={"taskKey": SANDBOX_B},
+            )
+            retry_payload = await retry.json()
+
+    assert unauthenticated.status == 401
+    assert missing.status == 400
+    assert response.status == 200
+    assert payload == {
+        "source": "hermes.sandbox_runner_cleanup",
+        "removed": True,
+    }
+    assert retry.status == 200
+    assert retry_payload == {
+        "source": "hermes.sandbox_runner_cleanup",
+        "removed": False,
+    }
+    assert cleanup.call_args_list == [call(SANDBOX_A), call(SANDBOX_A)]
+
+
+@pytest.mark.asyncio
+async def test_dedicated_cleanup_failure_is_redacted_and_fails_closed(tmp_path):
+    adapter = _adapter(tmp_path)
+    app = _app(adapter)
+
+    with patch(
+        "tools.environments.sandbox_runner.delete_sandbox_runner_overlay",
+        side_effect=RuntimeError(
+            f"runner socket /run/private.sock rejected {SANDBOX_A}"
+        ),
+    ):
+        async with TestClient(TestServer(app)) as client:
+            response = await client.post(
+                "/v1/dedicated-sandbox-cleanup",
+                headers={**AUTH, "X-Hermes-Sandbox-Task-Key": SANDBOX_A},
+                json={},
+            )
+            payload = await response.json()
+
+    assert response.status == 503
+    assert payload["error"]["code"] == "sandbox_runner_cleanup_failed"
+    assert SANDBOX_A not in json.dumps(payload)
+    assert "/run/private.sock" not in json.dumps(payload)
 
 
 @pytest.mark.asyncio
@@ -1026,6 +1105,7 @@ async def test_capabilities_advertise_controlled_sandbox_contract(tmp_path):
     assert supported_endpoints == {
         "/v1/chat/completions",
         "/v1/dedicated-sandbox-canary",
+        "/v1/dedicated-sandbox-cleanup",
         "/v1/dedicated-sandbox-identity",
         "/v1/responses",
     }
@@ -1036,6 +1116,10 @@ async def test_capabilities_advertise_controlled_sandbox_contract(tmp_path):
     assert body["endpoints"]["dedicated_sandbox_identity"] == {
         "method": "POST",
         "path": "/v1/dedicated-sandbox-identity",
+    }
+    assert body["endpoints"]["dedicated_sandbox_cleanup"] == {
+        "method": "POST",
+        "path": "/v1/dedicated-sandbox-cleanup",
     }
     assert body["features"]["run_submission"] is False
     assert body["features"]["session_chat"] is False

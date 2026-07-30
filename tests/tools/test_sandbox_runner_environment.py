@@ -25,6 +25,7 @@ from gateway.platforms.api_server import APIServerAdapter
 from tools.environments.sandbox_runner import (
     SANDBOX_RUNNER_CANARY_CHECKS,
     SandboxRunnerEnvironment,
+    delete_sandbox_runner_overlay,
     read_sandbox_runner_artifact,
     run_sandbox_runner_isolation_canary,
     sandbox_runner_identity_from_environment,
@@ -989,6 +990,50 @@ def test_explicit_remote_overlay_delete_rejects_malformed_runner_response(
 
     with pytest.raises(RuntimeError, match="Sandbox runner response is invalid"):
         environment.delete_remote_overlay()
+
+
+def test_explicit_remote_overlay_delete_accepts_idempotent_missing_result(
+    runner_fixture,
+):
+    server, socket_path, token_fd = runner_fixture
+    server.cleanup_response = {
+        "schemaVersion": 1,
+        "ok": True,
+        "removed": False,
+    }
+    environment = _environment(socket_path, token_fd)
+
+    assert environment.delete_remote_overlay() is False
+
+
+def test_control_plane_overlay_delete_uses_only_the_explicit_task_capability(
+    runner_fixture,
+    monkeypatch,
+):
+    server, socket_path, token_fd = runner_fixture
+    monkeypatch.setenv("HERMES_SANDBOX_RUNNER_SOCKET_PATH", str(socket_path))
+    monkeypatch.setenv("HERMES_SANDBOX_RUNNER_TOKEN_FD", str(token_fd))
+    monkeypatch.setattr(
+        sandbox_runner,
+        "_effective_uid",
+        lambda: os.fstat(token_fd).st_uid + 1,
+    )
+
+    assert delete_sandbox_runner_overlay(TASK_KEY) is True
+    assert server.requests == [
+        {
+            "path": "/v1/cleanup",
+            "authorization": f"Bearer {TOKEN}",
+            "contentType": "application/json",
+            "body": {"schemaVersion": 1, "taskKey": TASK_KEY},
+        }
+    ]
+
+    with pytest.raises(
+        RuntimeError,
+        match="Sandbox runner task identity is unavailable",
+    ):
+        delete_sandbox_runner_overlay("default")
 
 
 def test_existing_environment_reconnects_after_runner_restart(tmp_path: Path):

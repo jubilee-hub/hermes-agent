@@ -648,6 +648,39 @@ class SandboxRunnerEnvironment(BaseEnvironment):
                 self._calls.discard(call)
 
 
+def _sandbox_runner_environment_for_task_key(
+    task_key: str,
+) -> SandboxRunnerEnvironment:
+    raw_token_fd = os.getenv(
+        "HERMES_SANDBOX_RUNNER_TOKEN_FD",
+        str(DEFAULT_TOKEN_FD),
+    )
+    try:
+        token_fd = int(raw_token_fd)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Sandbox runner credential is unavailable.") from exc
+    socket_path = os.getenv(
+        "HERMES_SANDBOX_RUNNER_SOCKET_PATH",
+        DEFAULT_SOCKET_PATH,
+    )
+    return SandboxRunnerEnvironment(
+        task_key=task_key,
+        socket_path=socket_path,
+        token_fd=token_fd,
+        cwd="/workspace",
+        initialize_session=False,
+    )
+
+
+def delete_sandbox_runner_overlay(task_key: str) -> bool:
+    """Delete one explicit opaque task overlay through the host-local Runner."""
+    environment = _sandbox_runner_environment_for_task_key(task_key)
+    try:
+        return environment.delete_remote_overlay()
+    finally:
+        environment.cleanup()
+
+
 def read_sandbox_runner_artifact(
     task_id: str,
     filename: str,
@@ -662,25 +695,7 @@ def read_sandbox_runner_artifact(
     if overrides.get("env_type") != "sandbox_runner" or not isinstance(task_key, str):
         raise RuntimeError("Sandbox runner task identity is unavailable.")
 
-    raw_token_fd = os.getenv(
-        "HERMES_SANDBOX_RUNNER_TOKEN_FD",
-        str(DEFAULT_TOKEN_FD),
-    )
-    try:
-        token_fd = int(raw_token_fd)
-    except (TypeError, ValueError) as exc:
-        raise RuntimeError("Sandbox runner credential is unavailable.") from exc
-    socket_path = os.getenv(
-        "HERMES_SANDBOX_RUNNER_SOCKET_PATH",
-        DEFAULT_SOCKET_PATH,
-    )
-    environment = SandboxRunnerEnvironment(
-        task_key=task_key,
-        socket_path=socket_path,
-        token_fd=token_fd,
-        cwd="/workspace",
-        initialize_session=False,
-    )
+    environment = _sandbox_runner_environment_for_task_key(task_key)
     try:
         return environment.read_artifact(filename)
     finally:
